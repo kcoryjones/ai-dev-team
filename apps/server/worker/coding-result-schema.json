@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "properties": {
+    "summary": { "type": "string", "minLength": 1, "maxLength": 8000 },
+    "checks": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "properties": {
+          "command": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "status": { "type": "string", "enum": ["passed", "failed", "skipped"] }
+        },
+        "required": ["command", "status"],
+        "additionalProperties": false
+      }
+    },
+    "acceptanceCriteria": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "properties": {
+          "criterion": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "satisfied": { "type": "boolean" },
+          "evidence": { "type": "string", "maxLength": 2000 }
+        },
+        "required": ["criterion", "satisfied", "evidence"],
+        "additionalProperties": false
+      }
+    },
+    "questions": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 1000 } },
+    "risks": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 1000 } }
+  },
+  "required": ["summary", "checks", "acceptanceCriteria", "questions", "risks"],
+  "additionalProperties": false
+}

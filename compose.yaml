@@ -1,0 +1,78 @@
+name: engineering-team
+
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    image: local/engineering-team:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${ENGINEERING_TEAM_PORT:-4318}:4317"
+    environment:
+      ENGINEERING_TEAM_HOST: 0.0.0.0
+      ENGINEERING_TEAM_PORT: 4317
+      ENGINEERING_TEAM_DATABASE: /data/engineering-team.db
+      ENGINEERING_TEAM_WORKSPACE_ROOT: /workspaces
+      ENGINEERING_TEAM_PROJECT_NAME: ${ENGINEERING_TEAM_PROJECT_NAME:-}
+      ENGINEERING_TEAM_WEB_ROOT: public
+      ENGINEERING_TEAM_CONTROLLER_URL: http://controller:4319
+      ENGINEERING_TEAM_UID: ${ENGINEERING_TEAM_UID:-1000}
+      ENGINEERING_TEAM_GID: ${ENGINEERING_TEAM_GID:-1000}
+    volumes:
+      - engineering-team-data:/data
+      - engineering-team-worktrees:/worktrees
+      - ${WORKSPACE_ROOT:-..}:/workspaces:rw
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    depends_on:
+      controller:
+        condition: service_healthy
+
+  controller:
+    build:
+      context: .
+      target: controller
+    image: local/engineering-team-controller:latest
+    restart: unless-stopped
+    environment:
+      ENGINEERING_TEAM_CONTROLLER_HOST: 0.0.0.0
+      ENGINEERING_TEAM_CONTROLLER_PORT: 4319
+      ENGINEERING_TEAM_WORKSPACE_ROOT: /workspaces
+      ENGINEERING_TEAM_WORKTREE_ROOT: /worktrees
+      ENGINEERING_TEAM_WORKER_IMAGE: local/engineering-team-controller:latest
+      ENGINEERING_TEAM_CODEX_AUTH_FILE: /run/secrets/codex-auth.json
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      CODEX_API_KEY: ${CODEX_API_KEY:-}
+      CODEX_ACCESS_TOKEN: ${CODEX_ACCESS_TOKEN:-}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - engineering-team-worktrees:/worktrees
+      - ${WORKSPACE_ROOT:-..}:/workspaces:rw
+      - ${CODEX_AUTH_FILE:-/dev/null}:/run/secrets/codex-auth.json:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    stop_grace_period: 20s
+
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    image: local/engineering-team-test:latest
+    command: ["sh", "-lc", "npm test && npm run typecheck && npm run build"]
+
+volumes:
+  engineering-team-data:
+  engineering-team-worktrees:

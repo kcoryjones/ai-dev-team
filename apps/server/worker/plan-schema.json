@@ -1,0 +1,62 @@
+{
+  "type": "object",
+  "properties": {
+    "assistantMessage": { "type": "string", "minLength": 1, "maxLength": 8000 },
+    "objective": {
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 4000 }
+      },
+      "required": ["title", "description"],
+      "additionalProperties": false
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string", "pattern": "^[a-z0-9-]+$", "maxLength": 60 },
+          "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+          "description": { "type": "string", "maxLength": 2000 },
+          "assignedRole": {
+            "type": "string",
+            "enum": ["project_manager", "architect", "tech_lead", "backend_developer", "frontend_developer", "devops_database_engineer", "qa_engineer", "code_reviewer", "security_reviewer", "release_manager"]
+          },
+          "repositoryIds": {
+            "type": "array",
+            "maxItems": 20,
+            "items": { "type": "string" }
+          },
+          "acceptanceCriteria": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 20,
+            "items": { "type": "string", "minLength": 1, "maxLength": 500 }
+          },
+          "requiredChecks": {
+            "type": "object",
+            "properties": {
+              "qa": { "type": "boolean" },
+              "codeReview": { "type": "boolean" },
+              "security": { "type": "boolean" }
+            },
+            "required": ["qa", "codeReview", "security"],
+            "additionalProperties": false
+          },
+          "dependsOn": {
+            "type": "array",
+            "maxItems": 20,
+            "items": { "type": "string", "minLength": 1, "maxLength": 60 }
+          }
+        },
+        "required": ["key", "title", "description", "assignedRole", "repositoryIds", "acceptanceCriteria", "requiredChecks", "dependsOn"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["assistantMessage", "objective", "tasks"],
+  "additionalProperties": false
+}

@@ -1,0 +1,24 @@
+{
+  "name": "local-engineering-team",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A local, voice-ready command center for an AI software engineering team.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c cyan,magenta \"npm run dev -w @engineering-team/server\" \"npm run dev -w @engineering-team/web\"",
+    "build": "npm run build -w @engineering-team/contracts && npm run build -w @engineering-team/database && npm run build -w @engineering-team/server && npm run build -w @engineering-team/web",
+    "test": "npm run test -w @engineering-team/database && npm run test -w @engineering-team/server",
+    "typecheck": "npm run typecheck -w @engineering-team/contracts && npm run typecheck -w @engineering-team/database && npm run typecheck -w @engineering-team/server && npm run typecheck -w @engineering-team/web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=18.18"
+  }
+}
+

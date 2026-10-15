@@ -1,0 +1,15 @@
+.git
+.agents
+.codex
+.engineering-team-data
+node_modules
+**/node_modules
+dist
+**/dist
+*.db
+*.db-shm
+*.db-wal
+*.tsbuildinfo
+.env
+npm-debug.log*
+
