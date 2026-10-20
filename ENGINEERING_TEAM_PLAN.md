@@ -32,7 +32,7 @@ The Docker-first foundation slice is implemented and verified:
 - Dashboard control room for plan creation, approval decisions, and manual task progression
 - One workspace Project containing multiple sibling repositories
 - Separate Live Team and Kanban Tasks views
-- Durable per-agent director messages and a connected planning-only Project Manager conversation
+- Durable per-agent Director conversations backed by disposable read-only workers and each role's configured runtime
 - Versioned provider-neutral `RunSpec`, `RunEvent`, and `RunResult` contracts
 - Durable brain profiles, role assignments, agent runs, attempts, normalized run events, artifacts, usage, and exclusive task leases
 - One-to-one Project settings with setup completion, execution defaults, budgets, planning network policy, and plan-approval policy
@@ -41,6 +41,8 @@ The Docker-first foundation slice is implemented and verified:
 - Permanent Settings view for Project identity, repository access, and execution defaults
 - Validated Project Manager brain configuration with provider/harness compatibility and secret-free credential references
 - Codex-backed Project Manager turns that create schema-validated plans for director approval
+- Configurable inter-agent planning consultations, with separate read-only Architect and Tech Lead runs feeding Project Manager synthesis
+- Durable Project and Repository Context documents, revision history, and approval-gated agent-authored updates
 - Trusted Docker worker controller, disposable hardened planning workers, and isolated read-only repository clones
 - Durable, provider-neutral Model Backend registry with endpoint, protocol, model, auth-mode, credential-reference, and enabled-state configuration
 - Model Backend Settings UI for ChatGPT, OpenAI, Anthropic, RunPod, OpenRouter, Ollama, and custom services
@@ -53,7 +55,7 @@ The Docker-first foundation slice is implemented and verified:
 - Automated database and API tests using the Node test runner
 - Successful containerized tests, typecheck, production build, dependency audit, repository-write check, orchestration restart-persistence check, and live end-to-end smoke test
 
-Each engineering-team role can now select one compatible Coding Harness and Model Backend directly. The next execution step is resolving that pair when a role starts a run. Planning-runtime cancellation, streamed normalized events, restart recovery, and an end-to-end live-container test remain required before writable coding-agent execution is enabled.
+Each engineering-team role can select one compatible Coding Harness and Model Backend directly, and writable Codex task workers now resolve those assignments at run time. Coding-task events are normalized, persisted, and shown live; Director cancellation stops the disposable worker and records a stage-aware recovery point. Planning/consultation cancellation and live events, additional provider adapters, and broader end-to-end container coverage remain future work.
 
 ## Product vision
 
@@ -179,7 +181,7 @@ engineering-team start --repo /path/to/project
 
 The main interface should be an Engineering Director cockpit with two primary project views:
 
-1. **Live Team** shows every agent, presence, current task, and a durable role-specific conversation. The director can switch agents without leaving the overall project. Messages sent while no worker is running remain visibly queued.
+1. **Live Team** shows every agent, presence, current task, and a durable role-specific conversation. The Director can switch agents without leaving the overall project. Opening an agent is free; sending a message launches that role's configured disposable read-only worker.
 2. **Tasks** is a Kanban board showing proposed, ready, blocked, in-progress, review, and completed work. Cards show their assigned agent and repository while Project-wide work remains possible. Compact repository shortcuts and add/create controls appear beneath the two primary views in the navigation.
 
 Repositories are execution boundaries, not separate projects. A backend, frontend, task runner, and ETL repository may all contribute to one Project objective and one board.
@@ -220,6 +222,8 @@ Example voice interactions:
 | Release Manager | Integration, release checks, and changelog | Integration checkout writes |
 
 QA, code review, and security are independent gates. They should not be treated merely as subordinate agents expected to approve developer work.
+
+Required checks are fields on the implementation ticket, not separate Kanban tickets. After implementation, the orchestrator runs each required specialist against the exact implementation commit. A blocking result keeps the original ticket in progress, sends the combined findings back to its implementation agent for a bounded repair pass, and reruns every required gate against the repaired commit. Only an all-passing gate set moves the ticket to Review and enables Apply.
 
 ## Workflow model
 
@@ -486,23 +490,31 @@ Roles can be split into their full specializations once the end-to-end workflow 
 - [x] Harness registry and compatibility declarations
 - [x] Direct compatible harness/model assignment for every engineering-team role
 - [x] Codex-first harness installation and allowlisted worker-image version detection
-- [ ] Resolve each agent's harness/model assignment during execution
-- [ ] Role-specific prompt and tool policies
+- [x] Resolve each agent's harness/model assignment during execution
+- [x] Role-specific prompts and fixed per-run tool policies
 - [x] One disposable, hardened Docker container per Project Manager planning run
+- [x] Separate disposable read-only containers for planning collaborators
 - [x] Trusted worker controller with no Docker access in workers or the web/API container
-- [ ] Native Codex agent execution with streamed events and cancellation
+- [x] Native Codex task-agent execution with streamed events and cancellation
 - [x] Self-contained read-only checkout isolation and control-plane-owned planning result capture
+- [x] Writable implementation runs with same-ticket QA, code-review, and security gates
+- [x] Bounded automatic repair and full gate rerun before Review/Apply
+- [x] Kanban task workflow details with run history, evidence, usage, and event timelines
+- [x] Recovery after restart or lease expiry with stage-aware resume and preserved evidence
 - [x] Basic text interface and live planning status
-- [ ] One complete approval-driven feature workflow
+- [x] Release Manager integration proposals with Director approve-and-apply or reject-and-rework decisions
+- [x] One complete approval-driven feature workflow
 
 ### Milestone 2: Reliable orchestration
 
 - Durable dependency graph
 - Structured handoffs
 - Approval policies
-- Recovery after interrupted runs
-- Agent event stream
-- Retry, timeout, concurrency, and budget controls
+- [x] Recovery after interrupted runs
+- [x] Coding-task agent event stream
+- [x] Durable Director guidance with safe worker replacement and stage-aware restart
+- [x] Primary/fallback runtime routing with classified automatic failover and manual fallback retry
+- Broader retry, timeout, concurrency, and budget controls
 - Expanded dashboard
 
 ### Milestone 3: Hybrid inference
@@ -518,7 +530,7 @@ Roles can be split into their full specializations once the end-to-end workflow 
 
 - Push-to-talk input and spoken responses
 - Interruptible voice interaction
-- Direct conversation routing to specialists
+- [x] Direct conversation routing to specialists
 - Agent and dependency visualization
 - Diff, review, and approval interfaces
 - Optional desktop wrapper

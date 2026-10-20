@@ -23,6 +23,19 @@ const controllerUrl = process.env.ENGINEERING_TEAM_CONTROLLER_URL;
 const controllerClient = controllerUrl ? new HttpPlanningExecutor(controllerUrl) : null;
 
 const database = new TeamDatabase(databasePath);
+const startupRecoveries = database.reconcileInterruptedTaskRuns(new Date().toISOString(), true);
+if (startupRecoveries.length > 0) {
+  console.info(`Marked ${startupRecoveries.length} interrupted task workflow${startupRecoveries.length === 1 ? "" : "s"} as resumable`);
+}
+await stopRecoveredWorkers(startupRecoveries);
+const recoveryTimer = setInterval(async () => {
+  const recoveries = database.reconcileInterruptedTaskRuns(new Date().toISOString());
+  if (recoveries.length > 0) {
+    console.warn(`Recovered ${recoveries.length} task workflow${recoveries.length === 1 ? "" : "s"} with expired leases`);
+    await stopRecoveredWorkers(recoveries);
+  }
+}, 30_000);
+recoveryTimer.unref();
 const app = createApp(database, {
   workspaceRoot,
   workspaceName,
@@ -34,6 +47,7 @@ const server = serve({ fetch: app.fetch, hostname: host, port }, (info) => {
 });
 
 const shutdown = () => {
+  clearInterval(recoveryTimer);
   server.close(() => {
     database.close();
   });
@@ -41,6 +55,18 @@ const shutdown = () => {
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+async function stopRecoveredWorkers(recoveries: typeof startupRecoveries): Promise<void> {
+  if (!controllerClient?.stopTaskWorker) return;
+  for (const recovery of recoveries) {
+    try {
+      await controllerClient.stopTaskWorker(recovery.interruptedRunId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "unknown controller error";
+      console.warn(`Could not stop interrupted worker for run ${recovery.interruptedRunId}: ${message}`);
+    }
+  }
+}
 
 function findControlRepositoryRoot(start: string): string | null {
   let current = resolve(start);

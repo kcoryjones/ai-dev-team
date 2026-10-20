@@ -158,6 +158,26 @@ describe("TeamDatabase", () => {
     assert.equal(message.agentRole, "architect");
     assert.deepEqual(database.getOrchestrationState("project-1")?.messages, [message]);
 
+    const directive = database.createAgentDirective({
+      id: "directive-1",
+      projectId: "project-1",
+      agentRole: "architect",
+      content: "Prefer explicit application boundaries.",
+      sourceMessageId: message.id,
+    });
+    assert.deepEqual(database.getOrchestrationState("project-1")?.directives, [directive]);
+    database.removeAgentDirective("project-1", "architect", directive.id);
+    assert.deepEqual(database.getOrchestrationState("project-1")?.directives, []);
+
+    const defaults = database.getAgentConfigurations("project-1");
+    assert.equal(defaults.length, 10);
+    assert.equal(defaults.find((configuration) => configuration.agentRole === "architect")?.customized, false);
+    assert.deepEqual(defaults.find((configuration) => configuration.agentRole === "project_manager")?.consultationRoles, ["architect", "tech_lead"]);
+    const configuration = database.updateAgentConfiguration("project-1", "architect", "Favor simple, explicit boundaries.", ["tech_lead"]);
+    assert.equal(configuration.customized, true);
+    assert.deepEqual(configuration.consultationRoles, ["tech_lead"]);
+    assert.equal(database.getOrchestrationState("project-1")?.agentConfigurations.find((candidate) => candidate.agentRole === "architect")?.rolePrompt, "Favor simple, explicit boundaries.");
+
     database.close();
   });
 
@@ -746,6 +766,84 @@ describe("TeamDatabase", () => {
       }).runId,
       "run-2",
     );
+    database.close();
+  });
+
+  it("marks interrupted task runs as resumable and preserves their history", () => {
+    const database = new TeamDatabase(":memory:");
+    database.createProject({
+      id: "project-recovery",
+      name: "Recovery",
+      repository: { id: "repository-recovery", name: "backend", relativePath: "backend", defaultBranch: "main" },
+    });
+    const plan = database.createPlan({
+      projectId: "project-recovery",
+      objective: { id: "objective-recovery", title: "Recover", description: "Recover an interrupted workflow." },
+      tasks: [{
+        id: "task-recovery",
+        key: "recover",
+        title: "Recover task",
+        description: "Resume verification.",
+        assignedRole: "backend_developer",
+        repositoryIds: ["repository-recovery"],
+        acceptanceCriteria: ["Recovery is durable"],
+        dependsOn: [],
+      }],
+      approvalId: "approval-recovery",
+    });
+    database.decideApproval("project-recovery", plan.approval.id, "approved", null);
+    database.updateTaskStatus("project-recovery", "task-recovery", "in_progress");
+    const profile = database.createBrainProfile({
+      id: "brain-recovery",
+      projectId: "project-recovery",
+      name: "Recovery brain",
+      provider: "test",
+      harness: "fake",
+      modelClass: "test",
+      credentialRef: "TEST_TOKEN",
+      configuration: {},
+    });
+    const spec: RunSpec = {
+      schemaVersion: runContractSchemaVersion,
+      runId: "run-recovery",
+      projectId: "project-recovery",
+      taskId: "task-recovery",
+      agentRole: "qa_engineer",
+      runPurpose: "verification",
+      verificationCheck: "qa",
+      brainProfile: { provider: "test", harness: "fake", modelClass: "test", credentialRef: "TEST_TOKEN" },
+      repositories: [{ repositoryId: "repository-recovery", checkoutPath: "/workspace/backend", baseCommit: "abc123" }],
+      objective: "Recover",
+      taskDescription: "Verify",
+      acceptanceCriteria: ["Recovery is durable"],
+      upstreamArtifacts: ["implementation-run:run-implementation"],
+      permissions: { filesystem: "read-only", networkPolicy: "offline", allowedTools: [] },
+      limits: { timeoutSeconds: 30, retries: 1 },
+    };
+    database.createAgentRun(profile.id, spec);
+    database.createRunAttempt({ id: "attempt-recovery", runId: spec.runId, attemptNumber: 1 });
+    database.markRunAttemptRunning("attempt-recovery", "container-recovery", "sha256:worker");
+    database.acquireTaskLease({
+      taskId: "task-recovery",
+      runId: spec.runId,
+      leaseToken: "lease-recovery",
+      acquiredAt: "2026-10-19T00:00:00.000Z",
+      heartbeatAt: "2026-10-19T00:00:00.000Z",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+
+    const recoveries = database.reconcileInterruptedTaskRuns("2026-10-19T01:00:00.000Z", true);
+    assert.equal(recoveries.length, 1);
+    assert.equal(recoveries[0]?.stage, "verification");
+    assert.equal(recoveries[0]?.verificationCheck, "qa");
+    assert.equal(database.getAgentRun(spec.runId)?.status, "timed_out");
+    assert.equal(database.listRunAttempts(spec.runId)[0]?.status, "timed_out");
+    assert.equal(database.listRunEvents(spec.runId).at(-1)?.type, "run.timed_out");
+    assert.equal(database.getOrchestrationState("project-recovery")?.recoveries[0]?.taskId, "task-recovery");
+    assert.equal((database.connection.prepare("SELECT COUNT(*) AS count FROM task_leases").get() as { count: number }).count, 0);
+
+    database.resolveTaskWorkflowRecovery("project-recovery", "task-recovery");
+    assert.equal(database.getTaskWorkflowRecovery("project-recovery", "task-recovery"), null);
     database.close();
   });
 });

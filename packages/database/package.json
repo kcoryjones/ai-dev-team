@@ -14,7 +14,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test dist/*.test.js"
+    "test": "npm run build -w @engineering-team/contracts && npm run build && node --test dist/*.test.js"
   },
   "dependencies": {
     "@engineering-team/contracts": "*",

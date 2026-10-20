@@ -1,0 +1,36 @@
+{
+  "type": "object",
+  "properties": {
+    "response": { "type": "string", "minLength": 1, "maxLength": 8000 },
+    "directiveActions": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "properties": {
+          "action": { "type": "string", "enum": ["add", "remove"] },
+          "directiveId": { "type": ["string", "null"] },
+          "content": { "type": "string", "minLength": 1, "maxLength": 2000 }
+        },
+        "required": ["action", "directiveId", "content"],
+        "additionalProperties": false
+      }
+    },
+    "contextUpdates": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "properties": {
+          "repositoryId": { "type": ["string", "null"] },
+          "content": { "type": "string", "minLength": 1, "maxLength": 30000 },
+          "reason": { "type": "string", "minLength": 1, "maxLength": 2000 }
+        },
+        "required": ["repositoryId", "content", "reason"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["response", "directiveActions", "contextUpdates"],
+  "additionalProperties": false
+}

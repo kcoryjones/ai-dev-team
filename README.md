@@ -29,16 +29,30 @@ The complete product direction is recorded in [ENGINEERING_TEAM_PLAN.md](./ENGIN
 - Direct per-agent Coding Harness and Model Backend assignments for every engineering-team role
 - Protocol compatibility validation for each agent's selected harness/model pairing
 - Direct per-agent coding harness and model assignments from the Live Team view
+- Per-agent fallback harness/model assignments, automatic failover for quota and provider-runtime failures, and manual fallback retry for failed task runs
 - Credential references stored as environment-variable names without persisting secret values
 - A planning-only Project Manager that turns Live Team messages into validated proposed tickets
 - One disposable, hardened Codex container with isolated read-only clones for every PM planning turn
+- Configurable planning collaborators on each role, with Architect and Tech Lead enabled for the Project Manager by default
+- Real read-only consultant runs using each consulted agent's own role definition and assigned harness/model before PM ticket synthesis
+- Direct conversations with every specialist: sending a message launches that agent's disposable read-only worker with its role, directives, recent conversation, and project/repository context
+- Durable Markdown Project Context and per-repository Context with revision history
+- Approval-gated context updates proposed by the Project Manager, Architect, or Tech Lead during planning
 - A separate trusted worker controller; the web/API container and agent workers never receive the Docker socket
 - Director approval or rejection of proposed plans
 - Enforced task transitions from ready through implementation, review, and completion
+- Same-ticket QA, code-review, and security gates with visible pending/running/passed/failed state
+- A bounded automatic repair loop that reruns every required gate and exposes Apply only after all gates pass
+- A Release Manager assessment and durable Director integration approval that is the only path allowed to apply verified commits
+- Clickable Kanban task details with a live workflow timeline, run evidence, findings, changed files, model usage, and container events
+- Bounded live Codex task activity on Live Team and Kanban cards, with normalized command, tool, file-change, message, and lifecycle events persisted to each run
+- Director cancellation for task and conversation workers; task cancellation preserves evidence and creates a stage-aware Resume action
+- Safe Director guidance for active tasks: the current disposable worker is stopped, its history is preserved, and the interrupted stage automatically restarts with the new instruction
+- Restart and expired-lease recovery that preserves evidence, stops orphaned workers, and resumes at the interrupted workflow stage without repeating passed gates
 - A production container that runs as a configurable non-root user
 - Docker-native build, test, typecheck, health check, and startup workflows
 
-Writable implementation agents, additional provider adapters, richer event streaming, recovery, and voice are the next product layers. The current Project Manager runtime is planning-only: it can inspect isolated read-only clones and propose work, but it cannot change source code.
+Additional provider adapters, live Project Manager planning events, and voice are the next product layers. Conversations and planning remain read-only: agents can inspect isolated clones and advise or propose work, but they cannot change source code outside an approved task run.
 
 ## Prerequisite
 
@@ -72,21 +86,26 @@ Because Docker mounts the host parent folder at the generic `/workspaces` path, 
 
 On first launch, the application creates the workspace Project, derives its name from the parent workspace when that path is visible, automatically attaches every detected sibling Git repository, and opens directly into Live Team. You can rename the Project, create repositories, or adjust optional execution defaults later in Settings.
 
-Model Backends in Settings can record a ChatGPT-account backend without an API key, as well as API-key or unauthenticated local backends. Coding Harnesses independently register the CLIs that will drive those models and declare supported protocols and task capabilities. Each Live Team agent card directly selects its harness and model from two clickable lists in a compact popover; either choice may remain unassigned. These records intentionally store only configuration and environment-variable names—never key values or ChatGPT session tokens. The trusted controller currently verifies Codex against the actual allowlisted worker image; other harness registrations correctly show as missing until their images are implemented. The planning worker does not consume the new assignments yet.
+Model Backends in Settings can record a ChatGPT-account backend without an API key, as well as API-key or unauthenticated local backends. Coding Harnesses independently register the CLIs that will drive those models and declare supported protocols and task capabilities. Each Live Team agent card directly selects its harness and model from two clickable lists in a compact popover; either choice may remain unassigned. These records intentionally store only configuration and environment-variable names—never key values or ChatGPT session tokens. The trusted controller currently verifies Codex against the actual allowlisted worker image; other harness registrations correctly show as missing until their images are implemented.
 
-The currently connected Project Manager planning adapter still uses its earlier OpenAI API-key path. Until that adapter resolves the Project Manager's direct harness/model assignment and ChatGPT-session authentication, its existing proof flow is:
+The connected Codex adapter supports ChatGPT-session authentication or an API-key credential reference. Its planning flow is:
 
 1. Open Live Team and select the Project Manager.
 2. Describe the feature or outcome you want.
-3. Codex inspects isolated read-only clones in a disposable container and returns a validated task graph.
-4. Review the proposed tickets on the Tasks board and approve or reject the plan.
-5. Move approved tasks through start, review, and completion. Tasks become ready automatically when their dependencies complete.
+3. For a non-trivial goal, the Project Manager requests focused input from its configured planning collaborators. Each consultant runs in a separate disposable, read-only container with its own role prompt and runtime assignment.
+4. The Project Manager receives the consultation results and returns a validated task graph.
+5. Review the proposed tickets and any Project/Repository Context updates on the Tasks board, then approve or reject the plan.
+6. Start an approved task. Its implementation agent works in a disposable writable container, then the configured QA, Code Reviewer, and Security agents independently inspect that exact commit in their own disposable containers.
+7. If a required gate fails, the implementation agent receives the findings for one bounded repair pass and all required gates rerun. The same ticket stays in progress throughout; no review tickets are created.
+8. When every required gate passes, the task moves to Review and its verified branch becomes available to Apply. Dependencies become ready when the applied task completes.
 
-Only the OpenAI/Codex planning adapter executes today. It resolves the Project Manager's harness and model directly from the assignments on the Live Team view; other roles are saved but are not connected to task execution yet.
+The Codex/OpenAI Responses adapter executes planning, consultations, and approved tasks today. Each participant resolves its harness and model from its Live Team assignment. A configured consultant must have a compatible enabled runtime before the Project Manager can request its input.
 
 The controller image pins Codex with the `CODEX_VERSION` Docker build argument. Settings reports the installed CLI version only when a registered Codex harness uses the allowlisted worker image and a `codex` executable. A saved harness configuration does not install software by itself.
 
 Plans cannot execute before approval, invalid dependency graphs are rejected, and every decision and task transition is written to the audit log.
+
+Project Context is edited in Project Settings. Repository Context is edited from each repository's gear button. Both are durable Markdown shared with Project Manager, Architect, and Tech Lead planning runs. Direct edits create revisions immediately; agent-proposed replacements remain pending and are applied atomically only when their plan is approved.
 
 On Linux, set these values in `.env` to the account that owns the repositories:
 

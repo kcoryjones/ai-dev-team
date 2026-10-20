@@ -81,6 +81,7 @@ RUN apt-get update \
 
 COPY apps/server/worker/plan-schema.json /opt/engineering-team/plan-schema.json
 COPY apps/server/worker/coding-result-schema.json /opt/engineering-team/coding-result-schema.json
+COPY apps/server/worker/consultation-schema.json /opt/engineering-team/consultation-schema.json
 
 EXPOSE 4319
 

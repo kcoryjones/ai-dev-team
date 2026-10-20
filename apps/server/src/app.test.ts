@@ -417,6 +417,8 @@ describe("local API", () => {
         agentRole: "backend_developer",
         codingHarnessId: harness.harness.id,
         modelBackendId: backend.backend.id,
+        fallbackCodingHarnessId: null,
+        fallbackModelBackendId: null,
         assignedAt: database.listAgentRuntimeAssignments(project.project.id)[0]?.assignedAt,
       },
     );
@@ -480,7 +482,7 @@ describe("local API", () => {
     const clearResponse = await app.request(assignmentEndpoint, {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ codingHarnessId: null, modelBackendId: null }),
+      body: JSON.stringify({ codingHarnessId: null, modelBackendId: null, fallbackCodingHarnessId: null, fallbackModelBackendId: null }),
     });
     assert.equal(clearResponse.status, 200);
     assert.equal(((await clearResponse.json()) as { assignment: null }).assignment, null);
@@ -561,23 +563,83 @@ describe("local API", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  it("turns a Project Manager message into a validated proposed plan", async () => {
+  it("remembers Project Manager directives and applies them to later planning", async () => {
     const database = new TeamDatabase(":memory:");
     const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-api-"));
     createGitRepository(workspaceRoot, "backend");
+    let execution = 0;
     const app = createApp(database, {
       workspaceRoot,
       workspaceName: "Customer Platform",
       planningExecutor: {
         async execute(request) {
+          execution += 1;
           const repositoryId = request.run.repositories[0]?.repositoryId;
           assert.ok(repositoryId);
+          assert.match(request.projectContext, /customer-facing platform/);
+          assert.match(request.repositoryContexts.find((context) => context.repositoryId === repositoryId)?.content ?? "", /backend owns authenticated APIs/);
+          if (execution === 1) {
+            assert.equal(request.run.agentInstructions, "Plan the smallest practical delivery without inventing ceremony.");
+            assert.equal(request.directives.length, 0);
+            assert.match(request.conversation.at(-1)?.body ?? "", /From now on/);
+            return {
+              workerId: `worker-${request.run.runId}`,
+              imageDigest: "sha256:test-worker",
+              providerThreadId: "thread-directive",
+              proposal: {
+                assistantMessage: "Understood. I will keep verification on implementation tickets.",
+                intent: "directive_update",
+                directiveActions: [{
+                  action: "add",
+                  directiveId: null,
+                  content: "Represent QA, code review, and security as required checks instead of separate tickets.",
+                }],
+                consultationRequests: [],
+                contextUpdates: [],
+                objective: null,
+                tasks: [],
+              },
+            };
+          }
+          if (execution === 2) {
+            assert.deepEqual(request.availableConsultants, ["architect", "tech_lead"]);
+            assert.equal(request.consultationResults.length, 0);
+            return {
+              workerId: `worker-${request.run.runId}`,
+              imageDigest: "sha256:test-worker",
+              providerThreadId: "thread-consult",
+              proposal: {
+                assistantMessage: "I am checking the architecture and delivery approach before drafting tickets.",
+                intent: "consultation",
+                directiveActions: [],
+                consultationRequests: [
+                  { agentRole: "architect", question: "What boundaries and contracts should this feature preserve?" },
+                  { agentRole: "tech_lead", question: "What implementation sequence and verification should the plan use?" },
+                ],
+                contextUpdates: [],
+                objective: null,
+                tasks: [],
+              },
+            };
+          }
+          assert.equal(request.directives.length, 1);
+          assert.match(request.directives[0]?.content ?? "", /required checks/);
+          assert.deepEqual(request.consultationResults.map((result) => result.agentRole), ["architect", "tech_lead"]);
+          assert.equal(request.consultationResults.find((result) => result.agentRole === "architect")?.contextUpdates.length, 1);
           return {
             workerId: `worker-${request.run.runId}`,
             imageDigest: "sha256:test-worker",
             providerThreadId: "thread-test",
             proposal: {
               assistantMessage: "I mapped the goal into a small backend delivery plan.",
+              intent: "plan",
+              directiveActions: [],
+              consultationRequests: [],
+              contextUpdates: [{
+                repositoryId,
+                content: "# Backend\n\nThe backend owns authenticated APIs and customer notification preferences.",
+                reason: "Record the newly planned ownership of notification preferences.",
+              }],
               objective: {
                 title: "Add customer preferences",
                 description: "Allow customers to save and retrieve notification preferences.",
@@ -595,10 +657,42 @@ describe("local API", () => {
             usage: { inputTokens: 120, outputTokens: 80 },
           };
         },
+        async consult(request) {
+          assert.equal(request.requestingRole, "project_manager");
+          assert.equal(request.run.permissions.filesystem, "read-only");
+          assert.match(request.run.agentInstructions ?? "", request.run.agentRole === "architect" ? /system boundaries/ : /executable engineering approach/);
+          assert.match(request.projectContext, /customer-facing platform/);
+          assert.match(request.repositoryContexts[0]?.content ?? "", /backend owns authenticated APIs/);
+          return {
+            workerId: `consultant-${request.run.runId}`,
+            imageDigest: "sha256:test-worker",
+            providerThreadId: `thread-${request.run.agentRole}`,
+            response: request.run.agentRole === "architect"
+              ? "Keep preferences behind the existing authenticated backend boundary."
+              : "Implement persistence first, then endpoints, then focused integration tests.",
+            contextUpdates: request.run.agentRole === "architect" ? [{
+              repositoryId: request.repositoryContexts[0]!.repositoryId,
+              content: "# Backend\n\nThe backend owns authenticated APIs and customer notification preferences.",
+              reason: "Record the architectural ownership established by this plan.",
+            }] : [],
+          };
+        },
       },
     });
     const workspaceResponse = await app.request("/api/projects/workspace", { method: "POST" });
-    const workspace = (await workspaceResponse.json()) as { project: { id: string } };
+    const workspace = (await workspaceResponse.json()) as { project: { id: string; repositories: Array<{ id: string }> } };
+    const repositoryId = workspace.project.repositories[0]?.id;
+    assert.ok(repositoryId);
+    assert.equal((await app.request(`/api/projects/${workspace.project.id}/context`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: "# Product\n\nA customer-facing platform." }),
+    })).status, 200);
+    assert.equal((await app.request(`/api/projects/${workspace.project.id}/repositories/${repositoryId}/context`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: "# Backend\n\nThe backend owns authenticated APIs." }),
+    })).status, 200);
     const harnessResponse = await app.request(`/api/projects/${workspace.project.id}/harnesses`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -635,6 +729,34 @@ describe("local API", () => {
       }),
     });
     assert.equal(assignmentResponse.status, 200);
+    for (const consultantRole of ["architect", "tech_lead"] as const) {
+      const consultantAssignment = await app.request(`/api/projects/${workspace.project.id}/agents/${consultantRole}/runtime`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ codingHarnessId: harness.harness.id, modelBackendId: backend.backend.id }),
+      });
+      assert.equal(consultantAssignment.status, 200);
+    }
+
+    const configurationResponse = await app.request(`/api/projects/${workspace.project.id}/agents/project_manager/configuration`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ rolePrompt: "Plan the smallest practical delivery without inventing ceremony." }),
+    });
+    assert.equal(configurationResponse.status, 200);
+
+    const directiveResponse = await app.request(`/api/projects/${workspace.project.id}/agents/project_manager/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ body: "From now on, keep verification on implementation tickets." }),
+    });
+    assert.equal(directiveResponse.status, 202);
+
+    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+    let state = database.getOrchestrationState(workspace.project.id);
+    assert.equal(state?.tasks.length, 0);
+    assert.equal(state?.directives.length, 1);
+    assert.equal(state?.runs.find((run) => run.agentRole === "project_manager")?.status, "completed");
 
     const messageResponse = await app.request(`/api/projects/${workspace.project.id}/agents/project_manager/messages`, {
       method: "POST",
@@ -642,17 +764,38 @@ describe("local API", () => {
       body: JSON.stringify({ body: "Let customers manage notification preferences." }),
     });
     assert.equal(messageResponse.status, 202);
-
     await new Promise((resolvePromise) => setImmediate(resolvePromise));
-    const state = database.getOrchestrationState(workspace.project.id);
-    assert.equal(state?.runs[0]?.status, "completed");
+    state = database.getOrchestrationState(workspace.project.id);
+    assert.equal(state?.runs.filter((run) => ["project_manager", "architect", "tech_lead"].includes(run.agentRole)).every((run) => run.status === "completed"), true);
+    assert.equal(state?.runs.filter((run) => ["architect", "tech_lead"].includes(run.agentRole)).length, 2);
     assert.equal(state?.tasks[0]?.title, "Build preferences API");
     assert.equal(state?.tasks[0]?.status, "draft");
+    assert.equal(state?.proposedContextUpdates[0]?.status, "pending");
+    assert.doesNotMatch(state?.contexts.find((document) => document.repositoryId === repositoryId)?.content ?? "", /notification preferences/);
     assert.deepEqual(state?.tasks[0]?.requiredChecks, { qa: true, codeReview: true, security: true });
     assert.equal(state?.approvals[0]?.status, "pending");
     assert.equal(state?.messages.at(-1)?.author, "agent");
     assert.match(state?.messages.at(-1)?.body ?? "", /sent the plan for your approval/);
     assert.equal(database.listRunEvents(state?.runs[0]?.id ?? "").at(-1)?.type, "run.completed");
+
+    const approvalId = state?.approvals[0]?.id;
+    assert.ok(approvalId);
+    const approvalResponse = await app.request(`/api/projects/${workspace.project.id}/approvals/${approvalId}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision: "approved" }),
+    });
+    assert.equal(approvalResponse.status, 200);
+    state = database.getOrchestrationState(workspace.project.id);
+    assert.equal(state?.proposedContextUpdates[0]?.status, "applied");
+    assert.match(state?.contexts.find((document) => document.repositoryId === repositoryId)?.content ?? "", /notification preferences/);
+    assert.equal(state?.contextRevisions.filter((revision) => revision.repositoryId === repositoryId).length, 2);
+
+    const directiveId = state?.directives[0]?.id;
+    assert.ok(directiveId);
+    const removeResponse = await app.request(`/api/projects/${workspace.project.id}/agents/project_manager/directives/${directiveId}`, { method: "DELETE" });
+    assert.equal(removeResponse.status, 204);
+    assert.equal(database.getOrchestrationState(workspace.project.id)?.directives.length, 0);
 
     database.close();
     rmSync(workspaceRoot, { recursive: true, force: true });
@@ -809,14 +952,44 @@ describe("local API", () => {
       model: "gpt-test",
       authMode: "chatgpt",
     });
-    database.assignAgentRuntime(projectId, "backend_developer", "harness-1", "backend-1");
+    database.createModelBackend(projectId, "backend-fallback", {
+      name: "API fallback",
+      provider: "openai",
+      protocol: "openai-responses",
+      model: "gpt-fallback",
+      authMode: "api-key",
+      credentialRef: "OPENAI_API_KEY",
+    });
+    database.assignAgentRuntime(projectId, "backend_developer", "harness-1", "backend-1", "harness-1", "backend-fallback");
+    database.assignAgentRuntime(projectId, "release_manager", "harness-1", "backend-1");
     let applied = false;
     const app = createApp(database, {
       workspaceRoot,
       taskExecutor: {
-        async executeTask(request) {
+        async executeTask(request, onEvent) {
+          if (request.run.runPurpose === "release") {
+            assert.equal(request.run.agentRole, "release_manager");
+            return {
+              workerId: `engineering-team-task-${request.run.runId}`, imageDigest: "sha256:test", providerThreadId: "thread-release", branches: [],
+              result: {
+                schemaVersion: 1, status: "completed", summary: "Ready to integrate.", changedFiles: [], commits: [],
+                checks: [{ command: "release assessment", status: "passed" }],
+                acceptanceCriteria: request.run.acceptanceCriteria.map((criterion) => ({ criterion, satisfied: true, evidence: "Verified evidence is complete" })),
+                questions: [], risks: [], artifacts: [],
+              },
+            };
+          }
           assert.equal(request.run.agentRole, "backend_developer");
+          if (request.run.brainProfile.model === "gpt-test") throw new Error("429 quota limit reached");
+          assert.equal(request.run.brainProfile.model, "gpt-fallback");
+          assert.match(request.run.agentInstructions ?? "", /reliable backend behavior/);
           assert.equal(request.run.permissions.filesystem, "workspace-write");
+          onEvent?.({
+            type: "command.started",
+            message: "Running: npm test",
+            payload: { command: "npm test" },
+            createdAt: new Date().toISOString(),
+          });
           return {
             workerId: `engineering-team-task-${request.run.runId}`,
             imageDigest: "sha256:test",
@@ -864,6 +1037,7 @@ describe("local API", () => {
           assignedRole: "backend_developer",
           repositoryIds: [repositoryId],
           acceptanceCriteria: ["Backend works"],
+          requiredChecks: { qa: false, codeReview: false, security: false },
           dependsOn: [],
         }],
       }),
@@ -876,18 +1050,512 @@ describe("local API", () => {
     });
     const startResponse = await app.request(`/api/projects/${projectId}/tasks/${plan.tasks[0]!.id}/runs`, { method: "POST" });
     assert.equal(startResponse.status, 202);
-    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+    for (let index = 0; index < 20 && database.getOrchestrationState(projectId)?.tasks[0]?.status !== "review"; index += 1) {
+      await new Promise((resolvePromise) => setImmediate(resolvePromise));
+    }
     const state = database.getOrchestrationState(projectId);
-    assert.equal(state?.tasks[0]?.status, "review");
-    assert.equal(state?.runs[0]?.status, "completed");
-    assert.equal(state?.runs[0]?.result?.commits[0]?.sha, "abc123");
+    assert.equal(state?.tasks[0]?.status, "review", JSON.stringify({ runs: state?.runs.map((run) => ({ role: run.agentRole, status: run.status, purpose: run.spec.runPurpose, result: run.result?.summary })), messages: state?.messages.slice(-3) }));
+    assert.equal(state?.runs.every((run) => run.status === "completed"), true);
+    const implementationRun = state?.runs.find((run) => run.spec.runPurpose === "implementation");
+    assert.equal(implementationRun?.result?.commits[0]?.sha, "abc123");
+    assert.equal(database.listRunEvents(implementationRun!.id).some((event) => event.type === "runtime.fallback" && event.message?.includes("gpt-fallback")), true);
+    assert.equal(database.listRunEvents(implementationRun!.id).some((event) => event.type === "command.started" && event.message === "Running: npm test"), true);
+    const integrationApproval = state?.approvals.find((approval) => approval.type === "integration");
+    assert.equal(integrationApproval?.status, "pending");
+    const directApplyResponse = await app.request(`/api/projects/${projectId}/tasks/${plan.tasks[0]!.id}/apply`, { method: "POST" });
+    assert.equal(directApplyResponse.status, 409);
+    assert.equal(applied, false);
 
-    const applyResponse = await app.request(`/api/projects/${projectId}/tasks/${plan.tasks[0]!.id}/apply`, { method: "POST" });
+    const applyResponse = await app.request(`/api/projects/${projectId}/approvals/${integrationApproval!.id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ decision: "approved" }),
+    });
     const applyBody = await applyResponse.json();
     assert.equal(applyResponse.status, 200, JSON.stringify(applyBody));
     assert.equal(applied, true);
     assert.equal(database.getOrchestrationState(projectId)?.tasks[0]?.status, "completed");
-    assert.equal(database.getOrchestrationState(projectId)?.runs[0]?.result?.artifacts.some((artifact) => artifact.startsWith("applied:agent/")), true);
+    assert.equal(database.getOrchestrationState(projectId)?.runs.find((run) => run.spec.runPurpose === "implementation")?.result?.artifacts.some((artifact) => artifact.startsWith("applied:agent/")), true);
+
+    database.close();
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it("cancels an active task worker and preserves a resumable workflow", async () => {
+    const database = new TeamDatabase(":memory:");
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-api-"));
+    const projectId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const repositoryId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const taskId = "task-cancel";
+    const runId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    createGitRepository(workspaceRoot, "backend");
+    database.createProject({
+      id: projectId,
+      name: "Cancellation",
+      repository: { id: repositoryId, name: "backend", relativePath: "backend", defaultBranch: "main" },
+    });
+    const plan = database.createPlan({
+      projectId,
+      objective: { id: "objective-cancel", title: "Cancellation", description: "Exercise cancellation." },
+      tasks: [{
+        id: taskId,
+        key: "cancel",
+        title: "Long-running backend task",
+        description: "Keep running until cancelled.",
+        assignedRole: "backend_developer",
+        repositoryIds: [repositoryId],
+        acceptanceCriteria: ["Cancellation is recoverable"],
+        requiredChecks: { qa: true, codeReview: true, security: true },
+        dependsOn: [],
+      }],
+      approvalId: "approval-cancel",
+    });
+    database.decideApproval(projectId, plan.approval.id, "approved", null);
+    database.updateTaskStatus(projectId, taskId, "in_progress");
+    const profile = database.createBrainProfile({
+      id: "profile-cancel",
+      projectId,
+      name: "Cancellation profile",
+      provider: "openai",
+      harness: "codex",
+      modelClass: "coding",
+      credentialRef: "CODEX_ACCESS_TOKEN",
+      model: "gpt-test",
+      configuration: {},
+    });
+    database.createAgentRun(profile.id, {
+      schemaVersion: 1,
+      runId,
+      projectId,
+      taskId,
+      agentRole: "backend_developer",
+      runPurpose: "implementation",
+      brainProfile: { provider: "openai", harness: "codex", modelClass: "coding", credentialRef: "CODEX_ACCESS_TOKEN", model: "gpt-test" },
+      repositories: [{ repositoryId, checkoutPath: "/workspace/repos/01-backend", baseCommit: "unborn" }],
+      objective: "Cancellation",
+      taskDescription: "Keep running until cancelled.",
+      acceptanceCriteria: ["Cancellation is recoverable"],
+      permissions: { filesystem: "workspace-write", networkPolicy: "model-provider-only", allowedTools: ["run_tests"] },
+      limits: { timeoutSeconds: 900, retries: 1 },
+      verificationRound: 0,
+      upstreamArtifacts: [],
+    });
+    database.createRunAttempt({ id: "attempt-cancel", runId, attemptNumber: 1 });
+    database.markRunAttemptRunning("attempt-cancel", `engineering-team-task-${runId}`, "sha256:test");
+    database.acquireTaskLease({
+      taskId,
+      runId,
+      leaseToken: "lease-cancel",
+      acquiredAt: "2026-10-20T00:00:00.000Z",
+      heartbeatAt: "2026-10-20T00:00:00.000Z",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    const stoppedRuns: string[] = [];
+    const app = createApp(database, {
+      workspaceRoot,
+      taskExecutor: {
+        async executeTask() { throw new Error("Not used"); },
+        async applyTask() { throw new Error("Not used"); },
+        async stopTaskWorker(stoppedRunId) { stoppedRuns.push(stoppedRunId); },
+      },
+    });
+
+    const response = await app.request(`/api/projects/${projectId}/tasks/${taskId}/cancel`, { method: "POST" });
+    const body = await response.json() as { workerStopped: boolean; recovery: { taskId: string; projectId: string; stage: string; interruptedRunId: string } };
+    assert.equal(response.status, 200);
+    assert.equal(body.workerStopped, true);
+    assert.deepEqual(stoppedRuns, [runId]);
+    assert.equal(database.getAgentRun(runId)?.status, "cancelled");
+    assert.equal(database.listRunEvents(runId).at(-1)?.type, "run.cancelled");
+    assert.equal(body.recovery.taskId, taskId);
+    assert.equal(body.recovery.projectId, projectId);
+    assert.equal(body.recovery.interruptedRunId, runId);
+    assert.equal(body.recovery.stage, "implementation");
+    assert.throws(() => database.releaseTaskLease("lease-cancel"), /Task lease not found/);
+
+    database.close();
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it("redirects an active task and restarts it with Director guidance", async () => {
+    const database = new TeamDatabase(":memory:");
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-api-"));
+    const projectId = "12121212-1212-4212-8212-121212121212";
+    const repositoryId = "34343434-3434-4434-8434-343434343434";
+    const taskId = "task-redirect";
+    const interruptedRunId = "56565656-5656-4656-8656-565656565656";
+    createGitRepository(workspaceRoot, "backend");
+    database.createProject({ id: projectId, name: "Redirect", repository: { id: repositoryId, name: "backend", relativePath: "backend", defaultBranch: "main" } });
+    database.createCodingHarness(projectId, "harness-redirect", {
+      name: "Codex", adapter: "codex", executable: "codex", supportedProtocols: ["openai-responses"], capabilities: ["coding", "testing"],
+    });
+    database.createModelBackend(projectId, "backend-redirect", {
+      name: "ChatGPT", provider: "openai", protocol: "openai-responses", model: "gpt-test", authMode: "chatgpt",
+    });
+    database.assignAgentRuntime(projectId, "backend_developer", "harness-redirect", "backend-redirect");
+    database.assignAgentRuntime(projectId, "release_manager", "harness-redirect", "backend-redirect");
+    const plan = database.createPlan({
+      projectId,
+      objective: { id: "objective-redirect", title: "Redirect", description: "Change direction safely." },
+      tasks: [{ id: taskId, key: "redirect", title: "Implement API", description: "Build the endpoint.", assignedRole: "backend_developer", repositoryIds: [repositoryId], acceptanceCriteria: ["API works"], requiredChecks: { qa: false, codeReview: false, security: false }, dependsOn: [] }],
+      approvalId: "approval-redirect",
+    });
+    database.decideApproval(projectId, plan.approval.id, "approved", null);
+    database.updateTaskStatus(projectId, taskId, "in_progress");
+    const profile = database.createBrainProfile({ id: "profile-redirect", projectId, name: "Redirect profile", provider: "openai", harness: "codex", modelClass: "coding", credentialRef: "CODEX_ACCESS_TOKEN", model: "gpt-test", configuration: {} });
+    database.createAgentRun(profile.id, {
+      schemaVersion: 1, runId: interruptedRunId, projectId, taskId, agentRole: "backend_developer", runPurpose: "implementation",
+      brainProfile: { provider: "openai", harness: "codex", modelClass: "coding", credentialRef: "CODEX_ACCESS_TOKEN", model: "gpt-test" },
+      repositories: [{ repositoryId, checkoutPath: "/workspace/repos/01-backend", baseCommit: "unborn" }], objective: "Redirect", taskDescription: "Build the endpoint.", acceptanceCriteria: ["API works"], upstreamArtifacts: [],
+      permissions: { filesystem: "workspace-write", networkPolicy: "model-provider-only", allowedTools: ["run_tests"] }, limits: { timeoutSeconds: 900, retries: 1 },
+    });
+    database.createRunAttempt({ id: "attempt-redirect", runId: interruptedRunId, attemptNumber: 1 });
+    database.markRunAttemptRunning("attempt-redirect", `engineering-team-task-${interruptedRunId}`, "sha256:test");
+    database.acquireTaskLease({ taskId, runId: interruptedRunId, leaseToken: "lease-redirect", acquiredAt: "2026-10-20T00:00:00.000Z", heartbeatAt: "2026-10-20T00:00:00.000Z", expiresAt: "2099-01-01T00:00:00.000Z" });
+    const stoppedRuns: string[] = [];
+    const observedGuidance: string[] = [];
+    const app = createApp(database, {
+      workspaceRoot,
+      taskExecutor: {
+        async executeTask(request) {
+          if (request.run.directorGuidance) observedGuidance.push(request.run.directorGuidance);
+          if (request.run.runPurpose === "release") return {
+            workerId: `engineering-team-task-${request.run.runId}`, imageDigest: "sha256:test", providerThreadId: null, branches: [],
+            result: { schemaVersion: 1, status: "completed", summary: "Ready to integrate.", changedFiles: [], commits: [], checks: [{ command: "release", status: "passed" }], acceptanceCriteria: request.run.acceptanceCriteria.map((criterion) => ({ criterion, satisfied: true, evidence: "Verified" })), questions: [], risks: [], artifacts: [] },
+          };
+          return {
+            workerId: `engineering-team-task-${request.run.runId}`, imageDigest: "sha256:test", providerThreadId: null,
+            branches: [{ repositoryId, branch: "agent/redirected", sha: "redirect123" }],
+            result: { schemaVersion: 1, status: "completed", summary: "Implemented with Director guidance.", changedFiles: ["backend/api.ts"], commits: [{ repositoryId, sha: "redirect123" }], checks: [{ command: "npm test", status: "passed" }], acceptanceCriteria: [{ criterion: "API works", satisfied: true, evidence: "Tests pass" }], questions: [], risks: [], artifacts: [] },
+          };
+        },
+        async applyTask() { throw new Error("Not used"); },
+        async stopTaskWorker(runId) { stoppedRuns.push(runId); },
+      },
+    });
+    const guidance = "Keep the public API backwards compatible and use the existing authentication middleware.";
+    const response = await app.request(`/api/projects/${projectId}/tasks/${taskId}/redirect`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ guidance }),
+    });
+    assert.equal(response.status, 202, JSON.stringify(await response.clone().json()));
+    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+    assert.deepEqual(stoppedRuns, [interruptedRunId]);
+    assert.equal(database.getAgentRun(interruptedRunId)?.status, "cancelled");
+    assert.equal(observedGuidance.includes(guidance), true);
+    const replacement = database.listAgentRunsForTask(projectId, taskId).find((run) => run.id !== interruptedRunId && run.spec.runPurpose === "implementation");
+    assert.equal(replacement?.spec.directorGuidance, guidance);
+    assert.equal(database.getTaskWorkflowRecovery(projectId, taskId), null);
+    assert.match(database.getOrchestrationState(projectId)?.messages.find((message) => message.author === "director")?.body ?? "", /backwards compatible/);
+
+    database.close();
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it("cancels an active direct agent conversation", async () => {
+    const database = new TeamDatabase(":memory:");
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-api-"));
+    const projectId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const repositoryId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const runId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    createGitRepository(workspaceRoot, "backend");
+    database.createProject({ id: projectId, name: "Chat cancellation", repository: { id: repositoryId, name: "backend", relativePath: "backend", defaultBranch: "main" } });
+    const profile = database.createBrainProfile({
+      id: "profile-chat-cancel", projectId, name: "Architect chat", provider: "openai", harness: "codex", modelClass: "planning",
+      credentialRef: "CODEX_ACCESS_TOKEN", model: "gpt-test", configuration: {},
+    });
+    database.createAgentRun(profile.id, {
+      schemaVersion: 1, runId, projectId, agentRole: "architect", runPurpose: "consultation",
+      brainProfile: { provider: "openai", harness: "codex", modelClass: "planning", credentialRef: "CODEX_ACCESS_TOKEN", model: "gpt-test" },
+      repositories: [{ repositoryId, checkoutPath: "/workspace/repos/01-backend", baseCommit: "unborn" }],
+      objective: "Discuss architecture", taskDescription: "Answer the Director", acceptanceCriteria: ["Return advice"],
+      upstreamArtifacts: ["director-message:test"], permissions: { filesystem: "read-only", networkPolicy: "model-provider-only", allowedTools: ["inspect_repository", "respond_to_request"] },
+      limits: { timeoutSeconds: 900, retries: 1 },
+    });
+    database.createRunAttempt({ id: "attempt-chat-cancel", runId, attemptNumber: 1 });
+    database.markRunAttemptRunning("attempt-chat-cancel", `engineering-team-consultation-${runId}`, "sha256:test");
+    const stoppedRuns: string[] = [];
+    const app = createApp(database, {
+      workspaceRoot,
+      planningExecutor: {
+        async execute() { throw new Error("Not used"); },
+        async stopAgentWorker(stoppedRunId) { stoppedRuns.push(stoppedRunId); },
+      },
+    });
+    const response = await app.request(`/api/projects/${projectId}/agents/architect/runs/${runId}/cancel`, { method: "POST" });
+    assert.equal(response.status, 200);
+    assert.deepEqual(stoppedRuns, [runId]);
+    assert.equal(database.getAgentRun(runId)?.status, "cancelled");
+    assert.equal(database.listRunEvents(runId).at(-1)?.type, "run.cancelled");
+    assert.match(database.getOrchestrationState(projectId)?.messages.at(-1)?.body ?? "", /Cancelled by the Engineering Director/);
+
+    database.close();
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it("runs required checks, repairs failures, and applies only the verified commit", async () => {
+    const database = new TeamDatabase(":memory:");
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-api-"));
+    const projectId = "55555555-5555-4555-8555-555555555555";
+    const repositoryId = "66666666-6666-4666-8666-666666666666";
+    createGitRepository(workspaceRoot, "backend");
+    database.createProject({
+      id: projectId,
+      name: "Builder",
+      repository: { id: repositoryId, name: "backend", relativePath: "backend", defaultBranch: "main" },
+    });
+    database.createCodingHarness(projectId, "harness-gates", {
+      name: "Codex",
+      adapter: "codex",
+      executable: "codex",
+      supportedProtocols: ["openai-responses"],
+      capabilities: ["coding", "review", "testing"],
+    });
+    database.createModelBackend(projectId, "backend-gates", {
+      name: "ChatGPT",
+      provider: "openai",
+      protocol: "openai-responses",
+      model: "gpt-test",
+      authMode: "chatgpt",
+    });
+    for (const role of ["backend_developer", "qa_engineer", "code_reviewer", "security_reviewer", "release_manager"] as const) {
+      database.assignAgentRuntime(projectId, role, "harness-gates", "backend-gates");
+    }
+    const calls: Array<{ purpose: string | undefined; check: string | undefined; role: string; baseCommit: string }> = [];
+    let qaRuns = 0;
+    let appliedSha = "";
+    const app = createApp(database, {
+      workspaceRoot,
+      taskExecutor: {
+        async executeTask(request) {
+          calls.push({ purpose: request.run.runPurpose, check: request.run.verificationCheck, role: request.run.agentRole, baseCommit: request.run.repositories[0]!.baseCommit });
+          if (request.run.runPurpose === "verification") {
+            const failed = request.run.verificationCheck === "qa" && qaRuns++ === 0;
+            return {
+              workerId: `engineering-team-task-${request.run.runId}`,
+              imageDigest: "sha256:test",
+              providerThreadId: `thread-${request.run.verificationCheck}`,
+              branches: [],
+              result: {
+                schemaVersion: 1,
+                status: failed ? "failed" as const : "completed" as const,
+                summary: failed ? "The regression test fails." : `${request.run.verificationCheck} passed.`,
+                changedFiles: [],
+                commits: [],
+                checks: [{ command: request.run.verificationCheck ?? "verify", status: failed ? "failed" as const : "passed" as const }],
+                acceptanceCriteria: request.run.acceptanceCriteria.map((criterion) => ({ criterion, satisfied: !failed, evidence: failed ? "Regression reproduced" : "Verified" })),
+                questions: [],
+                risks: failed ? ["Blocking regression"] : [],
+                artifacts: [],
+              },
+            };
+          }
+          if (request.run.runPurpose === "release") {
+            return {
+              workerId: `engineering-team-task-${request.run.runId}`, imageDigest: "sha256:test", providerThreadId: "thread-release", branches: [],
+              result: {
+                schemaVersion: 1, status: "completed", summary: "Verified commit is ready for integration.", changedFiles: [], commits: [],
+                checks: [{ command: "release assessment", status: "passed" }],
+                acceptanceCriteria: request.run.acceptanceCriteria.map((criterion) => ({ criterion, satisfied: true, evidence: "Release evidence checked" })),
+                questions: [], risks: [], artifacts: [],
+              },
+            };
+          }
+          const repaired = request.run.runPurpose === "repair";
+          const sha = repaired ? "repair456" : "initial123";
+          return {
+            workerId: `engineering-team-task-${request.run.runId}`,
+            imageDigest: "sha256:test",
+            providerThreadId: repaired ? "thread-repair" : "thread-implementation",
+            branches: [{ repositoryId, branch: repaired ? "agent/repaired" : "agent/initial", sha }],
+            result: {
+              schemaVersion: 1,
+              status: "completed",
+              summary: repaired ? "Repaired the regression." : "Implemented the feature.",
+              changedFiles: ["backend/index.ts"],
+              commits: [{ repositoryId, sha }],
+              checks: [{ command: "npm test", status: "passed" }],
+              acceptanceCriteria: [{ criterion: "Backend works", satisfied: true, evidence: "Tests pass" }],
+              questions: [],
+              risks: [],
+              artifacts: [`git:${repaired ? "agent/repaired" : "agent/initial"}`],
+            },
+          };
+        },
+        async applyTask(request) {
+          appliedSha = request.repositories[0]!.sha;
+          return { applied: request.repositories.map((repository) => ({ repositoryId: repository.repositoryId, branch: repository.branch, sha: repository.sha, targetBranch: "main" })) };
+        },
+      },
+    });
+    const planResponse = await app.request(`/api/projects/${projectId}/plans`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        objective: { title: "Verified backend", description: "Implement and verify the backend" },
+        tasks: [{
+          key: "backend",
+          title: "Build verified backend",
+          description: "Create the behavior",
+          assignedRole: "backend_developer",
+          repositoryIds: [repositoryId],
+          acceptanceCriteria: ["Backend works"],
+          requiredChecks: { qa: true, codeReview: true, security: true },
+          dependsOn: [],
+        }],
+      }),
+    });
+    const plan = (await planResponse.json()) as { approval: { id: string }; tasks: Array<{ id: string }> };
+    await app.request(`/api/projects/${projectId}/approvals/${plan.approval.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decision: "approved" }),
+    });
+    const taskId = plan.tasks[0]!.id;
+    const startResponse = await app.request(`/api/projects/${projectId}/tasks/${taskId}/runs`, { method: "POST" });
+    assert.equal(startResponse.status, 202);
+    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+
+    const state = database.getOrchestrationState(projectId);
+    assert.equal(state?.tasks[0]?.status, "review");
+    assert.deepEqual(calls.map((call) => call.purpose), ["implementation", "verification", "verification", "verification", "repair", "verification", "verification", "verification", "release"]);
+    assert.deepEqual(calls.filter((call) => call.purpose === "verification").map((call) => call.check), ["qa", "code_review", "security", "qa", "code_review", "security"]);
+    assert.equal(calls[1]?.baseCommit, "initial123");
+    assert.equal(calls[5]?.baseCommit, "repair456");
+    assert.equal(state?.runs.filter((run) => run.spec.runPurpose === "verification").length, 6);
+    assert.equal(state?.runs.find((run) => run.spec.runPurpose === "repair")?.result?.commits[0]?.sha, "repair456");
+
+    const workflowResponse = await app.request(`/api/projects/${projectId}/tasks/${taskId}/workflow`);
+    assert.equal(workflowResponse.status, 200);
+    const workflow = await workflowResponse.json() as {
+      task: { id: string };
+      runs: Array<{ run: { spec: { runPurpose?: string } }; attempts: unknown[]; events: unknown[]; artifacts: unknown[]; usage: unknown[] }>;
+    };
+    assert.equal(workflow.task.id, taskId);
+    assert.equal(workflow.runs.length, 9);
+    assert.equal(workflow.runs.every((run) => run.attempts.length === 1 && run.events.length >= 5), true);
+    assert.equal(workflow.runs.filter((run) => run.run.spec.runPurpose === "verification").length, 6);
+
+    const integrationApproval = database.getOrchestrationState(projectId)?.approvals.find((approval) => approval.type === "integration" && approval.taskId === taskId);
+    assert.equal(integrationApproval?.status, "pending");
+    const applyResponse = await app.request(`/api/projects/${projectId}/approvals/${integrationApproval!.id}`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ decision: "approved" }),
+    });
+    assert.equal(applyResponse.status, 200);
+    assert.equal(appliedSha, "repair456");
+    assert.equal(database.getOrchestrationState(projectId)?.tasks[0]?.status, "completed");
+
+    database.close();
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it("resumes interrupted verification without repeating checks that already passed", async () => {
+    const database = new TeamDatabase(":memory:");
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-api-"));
+    const projectId = "77777777-7777-4777-8777-777777777777";
+    const repositoryId = "88888888-8888-4888-8888-888888888888";
+    createGitRepository(workspaceRoot, "backend");
+    database.createProject({ id: projectId, name: "Recovery", repository: { id: repositoryId, name: "backend", relativePath: "backend", defaultBranch: "main" } });
+    database.createCodingHarness(projectId, "harness-recovery", {
+      name: "Codex", adapter: "codex", executable: "codex", supportedProtocols: ["openai-responses"], capabilities: ["coding", "review", "testing"],
+    });
+    database.createModelBackend(projectId, "backend-recovery", {
+      name: "ChatGPT", provider: "openai", protocol: "openai-responses", model: "gpt-test", authMode: "chatgpt",
+    });
+    for (const role of ["backend_developer", "qa_engineer", "code_reviewer", "security_reviewer", "release_manager"] as const) {
+      database.assignAgentRuntime(projectId, role, "harness-recovery", "backend-recovery");
+    }
+    const plan = database.createPlan({
+      projectId,
+      objective: { id: "objective-resume", title: "Resume", description: "Resume interrupted verification." },
+      tasks: [{
+        id: "task-resume", key: "resume", title: "Resume checks", description: "Verify once.", assignedRole: "backend_developer",
+        repositoryIds: [repositoryId], acceptanceCriteria: ["All checks pass"], requiredChecks: { qa: true, codeReview: true, security: true }, dependsOn: [],
+      }],
+      approvalId: "approval-resume",
+    });
+    database.decideApproval(projectId, plan.approval.id, "approved", null);
+    database.updateTaskStatus(projectId, "task-resume", "in_progress");
+    const profile = database.createBrainProfile({
+      id: "profile-resume", projectId, name: "Resume profile", provider: "openai", harness: "codex", modelClass: "coding",
+      credentialRef: "CODEX_ACCESS_TOKEN", model: "gpt-test", configuration: {},
+    });
+    const baseCommit = "unborn";
+    const baseSpec = {
+      schemaVersion: 1 as const,
+      projectId,
+      taskId: "task-resume",
+      brainProfile: { provider: "openai", harness: "codex", modelClass: "coding", credentialRef: "CODEX_ACCESS_TOKEN", model: "gpt-test" },
+      repositories: [{ repositoryId, checkoutPath: "/workspace/repos/01-backend", baseCommit }],
+      objective: "Resume interrupted verification",
+      taskDescription: "Implement and verify",
+      acceptanceCriteria: ["All checks pass"],
+      permissions: { filesystem: "workspace-write" as const, networkPolicy: "model-provider-only", allowedTools: ["run_tests"] },
+      limits: { timeoutSeconds: 900, retries: 1 },
+    };
+    const implementationSpec = { ...baseSpec, runId: "run-implementation-resume", agentRole: "backend_developer" as const, runPurpose: "implementation" as const, verificationRound: 0, upstreamArtifacts: [] };
+    database.createAgentRun(profile.id, implementationSpec);
+    database.createRunAttempt({ id: "attempt-implementation-resume", runId: implementationSpec.runId, attemptNumber: 1 });
+    database.markRunAttemptRunning("attempt-implementation-resume", "worker-implementation", "sha256:test");
+    database.completeAgentRun(implementationSpec.runId, "attempt-implementation-resume", {
+      schemaVersion: 1, status: "completed", summary: "Implemented.", changedFiles: ["backend/index.js"], commits: [{ repositoryId, sha: "verified123" }],
+      checks: [{ command: "npm test", status: "passed" }], acceptanceCriteria: [{ criterion: "All checks pass", satisfied: true, evidence: "Implementation test" }], questions: [], risks: [], artifacts: ["git:agent/task-resum-run-impl"],
+    });
+    const qaSpec = { ...baseSpec, runId: "run-qa-resume", agentRole: "qa_engineer" as const, runPurpose: "verification" as const, verificationCheck: "qa" as const, verificationRound: 0, repositories: [{ ...baseSpec.repositories[0]!, baseCommit: "verified123", integrationBaseCommit: baseCommit }], upstreamArtifacts: [`implementation-run:${implementationSpec.runId}`] };
+    database.createAgentRun(profile.id, qaSpec);
+    database.createRunAttempt({ id: "attempt-qa-resume", runId: qaSpec.runId, attemptNumber: 1 });
+    database.markRunAttemptRunning("attempt-qa-resume", "worker-qa", "sha256:test");
+    database.completeAgentRun(qaSpec.runId, "attempt-qa-resume", {
+      schemaVersion: 1, status: "completed", summary: "QA passed.", changedFiles: [], commits: [], checks: [{ command: "qa", status: "passed" }],
+      acceptanceCriteria: [{ criterion: "All checks pass", satisfied: true, evidence: "QA evidence" }], questions: [], risks: [], artifacts: [],
+    });
+    const reviewSpec = { ...qaSpec, runId: "run-review-resume", agentRole: "code_reviewer" as const, verificationCheck: "code_review" as const };
+    database.createAgentRun(profile.id, reviewSpec);
+    database.createRunAttempt({ id: "attempt-review-resume", runId: reviewSpec.runId, attemptNumber: 1 });
+    database.markRunAttemptRunning("attempt-review-resume", "worker-review", "sha256:test");
+    database.acquireTaskLease({
+      taskId: "task-resume", runId: reviewSpec.runId, leaseToken: "lease-review-resume",
+      acquiredAt: "2026-10-19T00:00:00.000Z", heartbeatAt: "2026-10-19T00:00:00.000Z", expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    database.reconcileInterruptedTaskRuns("2026-10-19T01:00:00.000Z", true);
+
+    const resumedChecks: string[] = [];
+    const app = createApp(database, {
+      workspaceRoot,
+      taskExecutor: {
+        async executeTask(request) {
+          if (request.run.runPurpose === "release") {
+            return {
+              workerId: "worker-release", imageDigest: "sha256:test", providerThreadId: null, branches: [],
+              result: {
+                schemaVersion: 1, status: "completed", summary: "Ready to integrate.", changedFiles: [], commits: [],
+                checks: [{ command: "release assessment", status: "passed" }],
+                acceptanceCriteria: request.run.acceptanceCriteria.map((criterion) => ({ criterion, satisfied: true, evidence: "Evidence complete" })),
+                questions: [], risks: [], artifacts: [],
+              },
+            };
+          }
+          assert.equal(request.run.runPurpose, "verification");
+          resumedChecks.push(request.run.verificationCheck ?? "");
+          return {
+            workerId: `worker-${request.run.verificationCheck}`, imageDigest: "sha256:test", providerThreadId: null, branches: [],
+            result: {
+              schemaVersion: 1, status: "completed", summary: `${request.run.verificationCheck} passed.`, changedFiles: [], commits: [],
+              checks: [{ command: request.run.verificationCheck ?? "verify", status: "passed" }],
+              acceptanceCriteria: request.run.acceptanceCriteria.map((criterion) => ({ criterion, satisfied: true, evidence: "Recovered check passed" })), questions: [], risks: [], artifacts: [],
+            },
+          };
+        },
+        async applyTask() { throw new Error("Not used"); },
+      },
+    });
+    const resumeResponse = await app.request(`/api/projects/${projectId}/tasks/task-resume/resume`, { method: "POST" });
+    assert.equal(resumeResponse.status, 202, JSON.stringify(await resumeResponse.clone().json()));
+    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+    assert.deepEqual(resumedChecks, ["code_review", "security"]);
+    const state = database.getOrchestrationState(projectId);
+    assert.equal(state?.tasks[0]?.status, "review");
+    assert.equal(state?.integrationProposals[0]?.status, "pending");
+    assert.equal(state?.recoveries.length, 0);
+    assert.equal(database.getAgentRun(reviewSpec.runId)?.status, "timed_out");
+    assert.equal(database.listRunEvents(reviewSpec.runId).at(-1)?.type, "run.timed_out");
 
     database.close();
     rmSync(workspaceRoot, { recursive: true, force: true });
@@ -960,6 +1628,7 @@ describe("local API", () => {
           assignedRole: "code_reviewer",
           repositoryIds: [repositoryId],
           acceptanceCriteria: ["Implementation is verified"],
+          requiredChecks: { qa: false, codeReview: false, security: false },
           dependsOn: [],
         }],
       }),
@@ -1018,7 +1687,7 @@ describe("local API", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  it("attaches repository sections and queues messages for a specific agent", async () => {
+  it("attaches repository sections and runs a direct conversation with a specific agent", async () => {
     const database = new TeamDatabase(":memory:");
     const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-api-"));
     const app = createApp(database, { workspaceRoot, workspaceName: "Commerce Workspace" });
@@ -1080,13 +1749,50 @@ describe("local API", () => {
     assert.equal(missingFrontend?.relativePath, "frontend");
     assert.equal(missingFrontend?.available, false);
 
-    const sent = await app.request(`/api/projects/${firstBody.project.id}/agents/architect/messages`, {
+    database.createCodingHarness(firstBody.project.id, "harness-chat", {
+      name: "Codex", adapter: "codex", executable: "codex", supportedProtocols: ["openai-responses"], capabilities: ["planning", "coding"],
+    });
+    database.createModelBackend(firstBody.project.id, "backend-chat", {
+      name: "ChatGPT", provider: "openai", protocol: "openai-responses", model: "gpt-test", authMode: "chatgpt",
+    });
+    database.assignAgentRuntime(firstBody.project.id, "architect", "harness-chat", "backend-chat");
+    const conversationApp = createApp(database, {
+      workspaceRoot,
+      planningExecutor: {
+        async execute() { throw new Error("Not used"); },
+        async consult(request, onEvent) {
+          assert.equal(request.requestingRole, "engineering_director");
+          assert.equal(request.run.agentRole, "architect");
+          assert.equal(request.run.permissions.filesystem, "read-only");
+          assert.equal(request.repositorySources.length, 1);
+          assert.equal(request.repositorySources[0]?.name, "backend");
+          assert.match(request.conversation.at(-1)?.body ?? "", /application boundary/);
+          onEvent?.({ type: "repository.inspected", message: "Inspected backend", payload: {}, createdAt: new Date().toISOString() });
+          return {
+            workerId: `engineering-team-consultation-${request.run.runId}`,
+            imageDigest: "sha256:test",
+            providerThreadId: "thread-architect",
+            response: "Keep the API boundary in the backend and expose a versioned contract to the frontend.",
+            directiveActions: [{ action: "add", directiveId: null, content: "Prefer versioned contracts at application boundaries." }],
+            contextUpdates: [],
+          };
+        },
+      },
+    });
+    const sent = await conversationApp.request(`/api/projects/${firstBody.project.id}/agents/architect/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ body: "Check the application boundary." }),
     });
-    assert.equal(sent.status, 201);
-    assert.equal(database.getOrchestrationState(firstBody.project.id)?.messages[0]?.body, "Check the application boundary.");
+    assert.equal(sent.status, 202);
+    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+    const conversationState = database.getOrchestrationState(firstBody.project.id);
+    assert.deepEqual(conversationState?.messages.filter((message) => message.agentRole === "architect").map((message) => message.author), ["director", "agent"]);
+    assert.match(conversationState?.messages.at(-1)?.body ?? "", /versioned contract/);
+    assert.equal(conversationState?.directives.find((directive) => directive.agentRole === "architect")?.content, "Prefer versioned contracts at application boundaries.");
+    const conversationRun = conversationState?.runs.find((run) => run.agentRole === "architect");
+    assert.equal(conversationRun?.status, "completed");
+    assert.equal(database.listRunEvents(conversationRun!.id).some((event) => event.type === "repository.inspected"), true);
 
     database.close();
     rmSync(workspaceRoot, { recursive: true, force: true });

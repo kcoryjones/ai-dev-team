@@ -551,6 +551,190 @@ const migrations: Migration[] = [
         DEFAULT '{"qa":false,"codeReview":false,"security":false}';
     `,
   },
+  {
+    version: 15,
+    name: "agent_directives",
+    sql: `
+      CREATE TABLE agent_directives (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        agent_role TEXT NOT NULL CHECK (agent_role IN (
+          'project_manager', 'architect', 'tech_lead', 'backend_developer',
+          'frontend_developer', 'devops_database_engineer', 'qa_engineer',
+          'code_reviewer', 'security_reviewer', 'release_manager'
+        )),
+        content TEXT NOT NULL,
+        source_message_id TEXT NOT NULL REFERENCES agent_messages(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'removed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        removed_at TEXT
+      );
+
+      CREATE INDEX agent_directives_project_role_status_idx
+        ON agent_directives(project_id, agent_role, status, created_at);
+    `,
+  },
+  {
+    version: 16,
+    name: "agent_role_prompts",
+    sql: `
+      CREATE TABLE agent_configurations (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        agent_role TEXT NOT NULL CHECK (agent_role IN (
+          'project_manager', 'architect', 'tech_lead', 'backend_developer',
+          'frontend_developer', 'devops_database_engineer', 'qa_engineer',
+          'code_reviewer', 'security_reviewer', 'release_manager'
+        )),
+        role_prompt TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (project_id, agent_role)
+      );
+    `,
+  },
+  {
+    version: 17,
+    name: "agent_consultation_preferences",
+    sql: `
+      ALTER TABLE agent_configurations
+        ADD COLUMN consultation_roles_json TEXT NOT NULL DEFAULT '[]';
+
+      UPDATE agent_configurations
+        SET consultation_roles_json = '["architect","tech_lead"]'
+        WHERE agent_role = 'project_manager';
+    `,
+  },
+  {
+    version: 18,
+    name: "project_and_repository_context",
+    sql: `
+      CREATE TABLE context_documents (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        repository_id TEXT REFERENCES repositories(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (version > 0),
+        updated_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (repository_id)
+      );
+
+      CREATE UNIQUE INDEX context_documents_project_scope_idx
+        ON context_documents(project_id) WHERE repository_id IS NULL;
+      CREATE INDEX context_documents_project_idx
+        ON context_documents(project_id, repository_id);
+
+      CREATE TABLE context_revisions (
+        id TEXT PRIMARY KEY,
+        document_id TEXT NOT NULL REFERENCES context_documents(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        repository_id TEXT REFERENCES repositories(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (version > 0),
+        updated_by TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX context_revisions_document_version_idx
+        ON context_revisions(document_id, version DESC);
+
+      CREATE TABLE proposed_context_updates (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        approval_id TEXT NOT NULL REFERENCES approval_requests(id) ON DELETE CASCADE,
+        repository_id TEXT REFERENCES repositories(id) ON DELETE CASCADE,
+        content TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        proposed_by_role TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'applied', 'rejected')),
+        created_at TEXT NOT NULL,
+        decided_at TEXT
+      );
+
+      CREATE INDEX proposed_context_updates_approval_idx
+        ON proposed_context_updates(approval_id, status);
+    `,
+  },
+  {
+    version: 19,
+    name: "task_workflow_recovery",
+    sql: `
+      CREATE TABLE task_workflow_recoveries (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        interrupted_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        stage TEXT NOT NULL CHECK (stage IN ('implementation', 'repair', 'verification')),
+        verification_check TEXT CHECK (verification_check IS NULL OR verification_check IN ('qa', 'code_review', 'security')),
+        reason TEXT NOT NULL,
+        interrupted_at TEXT NOT NULL
+      );
+
+      CREATE INDEX task_workflow_recoveries_project_idx
+        ON task_workflow_recoveries(project_id, interrupted_at DESC);
+    `,
+  },
+  {
+    version: 20,
+    name: "release_manager_integration_proposals",
+    sql: `
+      CREATE TABLE task_workflow_recoveries_next (
+        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        interrupted_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        stage TEXT NOT NULL CHECK (stage IN ('implementation', 'repair', 'verification', 'release')),
+        verification_check TEXT CHECK (verification_check IS NULL OR verification_check IN ('qa', 'code_review', 'security')),
+        reason TEXT NOT NULL,
+        interrupted_at TEXT NOT NULL
+      );
+
+      INSERT INTO task_workflow_recoveries_next
+        SELECT * FROM task_workflow_recoveries;
+      DROP TABLE task_workflow_recoveries;
+      ALTER TABLE task_workflow_recoveries_next RENAME TO task_workflow_recoveries;
+      CREATE INDEX task_workflow_recoveries_project_idx
+        ON task_workflow_recoveries(project_id, interrupted_at DESC);
+
+      CREATE TABLE task_integration_proposals (
+        approval_id TEXT PRIMARY KEY REFERENCES approval_requests(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        change_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        release_run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'applied')),
+        created_at TEXT NOT NULL,
+        decided_at TEXT,
+        applied_at TEXT
+      );
+
+      CREATE INDEX task_integration_proposals_project_idx
+        ON task_integration_proposals(project_id, created_at DESC);
+      CREATE INDEX task_integration_proposals_task_idx
+        ON task_integration_proposals(task_id, created_at DESC);
+    `,
+  },
+  {
+    version: 21,
+    name: "task_workflow_director_guidance",
+    sql: `
+      ALTER TABLE task_workflow_recoveries ADD COLUMN guidance TEXT;
+    `,
+  },
+  {
+    version: 22,
+    name: "agent_runtime_fallbacks",
+    sql: `
+      ALTER TABLE agent_runtime_assignments
+        ADD COLUMN fallback_coding_harness_id TEXT REFERENCES coding_harnesses(id) ON DELETE SET NULL;
+      ALTER TABLE agent_runtime_assignments
+        ADD COLUMN fallback_model_backend_id TEXT REFERENCES model_backends(id) ON DELETE SET NULL;
+
+      CREATE INDEX agent_runtime_assignments_fallback_harness_idx
+        ON agent_runtime_assignments(fallback_coding_harness_id);
+      CREATE INDEX agent_runtime_assignments_fallback_backend_idx
+        ON agent_runtime_assignments(fallback_model_backend_id);
+    `,
+  },
 ];
 
 export function migrate(database: Database.Database): void {
