@@ -2,9 +2,7 @@
 
 A local command center for directing an AI software engineering organization. It runs beside one or more Git repositories, stores operational state in SQLite, and is designed for voice or text interaction.
 
-Architecture decisions are recorded in [ENGINEERING_TEAM_PLAN.md](ENGINEERING_TEAM_PLAN.md) and the [architecture decision records](docs/adr/).
-
-The complete product direction is recorded in [ENGINEERING_TEAM_PLAN.md](./ENGINEERING_TEAM_PLAN.md).
+The complete product direction is recorded in [ENGINEERING_TEAM_PLAN.md](ENGINEERING_TEAM_PLAN.md), with detailed decisions in the [architecture decision records](docs/adr/).
 
 ## What works today
 
@@ -14,13 +12,13 @@ The complete product direction is recorded in [ENGINEERING_TEAM_PLAN.md](./ENGIN
 - Persistent projects and an append-only audit log in SQLite
 - Durable objectives and dependency-aware task graphs
 - Sibling repositories grouped under one workspace Project
-- A Live Team view with agent presence, current assignments, and durable queued messages
+- A Live Team view with agent presence, current assignments, durable conversations, directives, and memory placeholders
 - A Kanban Tasks view covering proposed work through completion
 - Assignments across all ten engineering agent roles
 - Provider-neutral agent-run contracts and durable runtime-state storage
 - Durable Project setup and execution settings with a validated local API
 - Zero-setup launch that derives the Project name and automatically attaches sibling Git repositories
-- A permanent Settings view for Project identity, repository access, and execution defaults
+- Project and repository context editors plus a permanent Settings view for execution defaults, harnesses, and model backends
 - Reusable Model Backend settings for ChatGPT, OpenAI, Anthropic, RunPod, OpenRouter, Ollama, and custom endpoints
 - Configurable API protocol, model ID, endpoint URL, authentication mode, credential reference, and enabled state per backend
 - Reusable Coding Harness settings for Codex, Claude Code, OpenCode, Pi, DeepSeek Harness, Grok Build, and custom CLIs
@@ -52,7 +50,13 @@ The complete product direction is recorded in [ENGINEERING_TEAM_PLAN.md](./ENGIN
 - A production container that runs as a configurable non-root user
 - Docker-native build, test, typecheck, health check, and startup workflows
 
-Additional provider adapters, live Project Manager planning events, and voice are the next product layers. Conversations and planning remain read-only: agents can inspect isolated clones and advise or propose work, but they cannot change source code outside an approved task run.
+Additional executable provider adapters, native Project Manager worker-event streaming, and voice are the next product layers. Conversations and planning remain read-only: agents can inspect isolated clones and advise or propose work, but they cannot change source code outside an approved task run.
+
+## Current execution boundary
+
+The settings UI can describe many harnesses and model providers, but configuration does not install or connect an adapter. End-to-end execution currently supports Codex with an OpenAI Responses backend using either a mounted ChatGPT `auth.json` or an API-key credential reference. Primary/fallback routing is operational for compatible connected runtimes; AWS Bedrock, Anthropic, RunPod, OpenCode, Pi, DeepSeek Harness, Grok Build, Ollama, and other entries remain configuration-only until their worker adapters are implemented.
+
+Worker containers request CPU, memory, and PID limits from Docker. Hosts without the required cgroup capabilities may warn that some limits cannot be enforced; review those warnings before relying on the installation for unattended or untrusted workloads. Endpoint-level network egress enforcement is also still future hardening.
 
 ## Prerequisite
 
@@ -97,7 +101,7 @@ The connected Codex adapter supports ChatGPT-session authentication or an API-ke
 5. Review the proposed tickets and any Project/Repository Context updates on the Tasks board, then approve or reject the plan.
 6. Start an approved task. Its implementation agent works in a disposable writable container, then the configured QA, Code Reviewer, and Security agents independently inspect that exact commit in their own disposable containers.
 7. If a required gate fails, the implementation agent receives the findings for one bounded repair pass and all required gates rerun. The same ticket stays in progress throughout; no review tickets are created.
-8. When every required gate passes, the task moves to Review and its verified branch becomes available to Apply. Dependencies become ready when the applied task completes.
+8. When every required gate passes, the Release Manager prepares an integration proposal. The Director can approve and apply it or reject it for rework. Dependencies become ready when the approved change is applied and the task completes.
 
 The Codex/OpenAI Responses adapter executes planning, consultations, and approved tasks today. Each participant resolves its harness and model from its Live Team assignment. A configured consultant must have a compatible enabled runtime before the Project Manager can request its input.
 

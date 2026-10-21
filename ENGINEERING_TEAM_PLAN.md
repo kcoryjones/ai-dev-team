@@ -6,9 +6,9 @@ This document records the current product and architecture direction so work can
 
 The project will be a repository-independent local application that presents an AI engineering team through a locally hosted web interface. The user acts as Engineering Director and communicates primarily with an Orchestrator/Project Manager, using voice or text. Agent activity, decisions, tasks, approvals, reviews, and release state persist in SQLite.
 
-### Implementation progress — 2026-10-12
+### Implementation progress — 2026-10-21
 
-The Docker-first foundation slice is implemented and verified:
+The Docker-first Codex vertical slice is implemented and verified:
 
 - npm/TypeScript workspace with separate web, server, contracts, and database packages
 - Local Hono API bound to loopback by default
@@ -51,11 +51,15 @@ The Docker-first foundation slice is implemented and verified:
 - Pinned Codex-first worker installation with controller-owned worker-image capability inspection
 - Installed, missing, and controller-unavailable harness status in Settings
 - Durable independent harness/model assignment for each role through compact clickable Live Team card popovers
+- Durable primary/fallback runtime assignment, classified automatic failover, visible fallback events, and manual failed-task fallback retry
+- Safe Director guidance that stops an active task worker, preserves its run history, and restarts the interrupted workflow stage with the new instruction
 - Append-only audit events for plan creation, approval decisions, and task transitions
 - Automated database and API tests using the Node test runner
 - Successful containerized tests, typecheck, production build, dependency audit, repository-write check, orchestration restart-persistence check, and live end-to-end smoke test
 
-Each engineering-team role can select one compatible Coding Harness and Model Backend directly, and writable Codex task workers now resolve those assignments at run time. Coding-task events are normalized, persisted, and shown live; Director cancellation stops the disposable worker and records a stage-aware recovery point. Planning/consultation cancellation and live events, additional provider adapters, and broader end-to-end container coverage remain future work.
+Each engineering-team role can select a primary and fallback Coding Harness/Model Backend pair directly. Planning, consultation, conversation, implementation, verification, and release workers resolve those assignments at run time. Coding and consultation events are normalized, persisted, and shown live; Director cancellation stops disposable task or conversation workers, and task cancellation records a stage-aware recovery point. Native Project Manager worker-event streaming, non-Codex/non-OpenAI execution adapters, stronger egress enforcement, broader resource-limit enforcement, and expanded clean-install coverage remain future work.
+
+The registry is intentionally broader than the connected execution layer. Codex with an OpenAI Responses backend is the only end-to-end adapter today. Entries for AWS Bedrock, Anthropic, RunPod, OpenCode, Pi, DeepSeek Harness, Grok Build, Ollama, and other services are configuration-only until their worker adapters and capability checks are implemented.
 
 ## Product vision
 
@@ -507,24 +511,25 @@ Roles can be split into their full specializations once the end-to-end workflow 
 
 ### Milestone 2: Reliable orchestration
 
-- Durable dependency graph
-- Structured handoffs
-- Approval policies
+- [x] Durable dependency graph
+- [x] Structured handoffs through run specs, upstream artifacts, results, and evidence
+- [x] Plan and integration approval policies
 - [x] Recovery after interrupted runs
 - [x] Coding-task agent event stream
 - [x] Durable Director guidance with safe worker replacement and stage-aware restart
 - [x] Primary/fallback runtime routing with classified automatic failover and manual fallback retry
 - Broader retry, timeout, concurrency, and budget controls
-- Expanded dashboard
+- [x] Live Team, full Kanban, approval queue, and detailed workflow timeline
+- Native event streaming beyond the current bounded polling paths
 
 ### Milestone 3: Hybrid inference
 
 - RunPod compatibility adapter if required
-- Provider registry and secure credentials
-- Role-based model routing
-- Model capability evaluation suite
-- Fallback and retry policies
-- Usage and cost reporting
+- [x] Provider registry and secret-free credential references
+- [x] Role-based primary/fallback routing for the connected Codex/OpenAI adapter
+- Model capability evaluation suite and preflight matrix
+- Cross-provider execution adapters and failover
+- Complete usage, latency, and cost reporting
 
 ### Milestone 4: Voice and richer interface
 
