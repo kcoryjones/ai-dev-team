@@ -48,13 +48,20 @@ export interface TaskExecutor {
 }
 
 export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, HarnessInspector {
-  constructor(private readonly controllerUrl: string) {}
+  constructor(
+    private readonly controllerUrl: string,
+    private readonly controllerToken: string | undefined = process.env.ENGINEERING_TEAM_CONTROLLER_TOKEN,
+  ) {}
+
+  private headers(): Record<string, string> {
+    return this.controllerToken ? { authorization: `Bearer ${this.controllerToken}` } : {};
+  }
 
   async execute(request: PlanningRunRequest): Promise<PlanningRunResponse> {
     const timeoutMs = (request.run.limits.timeoutSeconds + 30) * 1_000;
     const response = await fetch(new URL("/runs", this.controllerUrl), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...this.headers() },
       body: JSON.stringify(request),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -80,13 +87,15 @@ export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, Har
     let cursor = 0;
     const responsePromise = fetch(new URL("/consultation-runs", this.controllerUrl), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...this.headers() },
       body: JSON.stringify(request),
       signal: AbortSignal.timeout(timeoutMs),
     });
     const poll = async () => {
       try {
-        const response = await fetch(new URL(`/task-workers/${encodeURIComponent(request.run.runId)}/events?after=${cursor}`, this.controllerUrl), { signal: AbortSignal.timeout(5_000) });
+        const response = await fetch(new URL(`/task-workers/${encodeURIComponent(request.run.runId)}/events?after=${cursor}`, this.controllerUrl), {
+          signal: AbortSignal.timeout(5_000), headers: this.headers(),
+        });
         if (!response.ok) return;
         const body = await response.json() as { events?: Array<TaskExecutionEvent & { sequence: number }> };
         for (const event of body.events ?? []) {
@@ -137,14 +146,14 @@ export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, Har
     let cursor = 0;
     const responsePromise = fetch(new URL("/task-runs", this.controllerUrl), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...this.headers() },
       body: JSON.stringify(request),
       signal: AbortSignal.timeout(timeoutMs),
     });
     const poll = async () => {
       try {
         const response = await fetch(new URL(`/task-workers/${encodeURIComponent(request.run.runId)}/events?after=${cursor}`, this.controllerUrl), {
-          signal: AbortSignal.timeout(5_000),
+          signal: AbortSignal.timeout(5_000), headers: this.headers(),
         });
         if (!response.ok) return;
         const body = await response.json() as { events?: Array<TaskExecutionEvent & { sequence: number }> };
@@ -189,7 +198,7 @@ export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, Har
   async applyTask(request: ApplyCodingRunRequest): Promise<ApplyCodingRunResponse> {
     const response = await fetch(new URL("/task-runs/apply", this.controllerUrl), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...this.headers() },
       body: JSON.stringify(request),
       signal: AbortSignal.timeout(120_000),
     });
@@ -212,6 +221,7 @@ export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, Har
   async stopTaskWorker(runId: string): Promise<void> {
     const response = await fetch(new URL(`/task-workers/${encodeURIComponent(runId)}`, this.controllerUrl), {
       method: "DELETE",
+      headers: this.headers(),
       signal: AbortSignal.timeout(15_000),
     });
     if (response.ok) return;
@@ -228,6 +238,7 @@ export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, Har
 
   async getCapabilities(): Promise<WorkerControllerCapabilities> {
     const response = await fetch(new URL("/capabilities", this.controllerUrl), {
+      headers: this.headers(),
       signal: AbortSignal.timeout(10_000),
     });
     const text = await response.text();
@@ -249,6 +260,7 @@ export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, Har
   async preflightCodex(): Promise<WorkerHarnessPreflight> {
     const response = await fetch(new URL("/preflight/codex", this.controllerUrl), {
       method: "POST",
+      headers: this.headers(),
       signal: AbortSignal.timeout(45_000),
     });
     const text = await response.text();
@@ -278,7 +290,7 @@ export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, Har
   private async postModelBackendInspection<T>(path: string, backend: ModelBackendSummary): Promise<T> {
     const response = await fetch(new URL(path, this.controllerUrl), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...this.headers() },
       body: JSON.stringify({ backend }),
       signal: AbortSignal.timeout(30_000),
     });

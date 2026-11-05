@@ -21,7 +21,10 @@ const workspaceName =
   "Project";
 const staticRoot = process.env.ENGINEERING_TEAM_WEB_ROOT;
 const controllerUrl = process.env.ENGINEERING_TEAM_CONTROLLER_URL;
-const controllerClient = controllerUrl ? new HttpPlanningExecutor(controllerUrl) : null;
+const controllerToken = process.env.ENGINEERING_TEAM_CONTROLLER_TOKEN;
+const controllerClient = controllerUrl
+  ? new HttpPlanningExecutor(controllerUrl, controllerToken || undefined)
+  : null;
 
 const database = new TeamDatabase(databasePath);
 const recoverRuns = createRunRecovery(database, controllerClient);

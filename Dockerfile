@@ -86,7 +86,7 @@ COPY apps/server/worker/consultation-schema.json /opt/engineering-team/consultat
 EXPOSE 4319
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=5 \
-  CMD node -e "fetch('http://127.0.0.1:4319/health').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:4319/health', { headers: { authorization: 'Bearer ' + process.env.ENGINEERING_TEAM_CONTROLLER_TOKEN } }).then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"
 
 ENTRYPOINT ["tini", "--"]
 CMD ["node", "apps/server/dist/controller-main.js"]

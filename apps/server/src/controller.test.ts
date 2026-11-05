@@ -32,6 +32,7 @@ async function controllerFixture(t: TestContext, { releasePasses = true, commitW
   const source = join(workspaceRoot, "backend");
   const invocationFile = join(root, "invocations.jsonl");
   const reportOverrideFile = join(root, "report-override.json");
+  const fixtureToken = randomUUID();
   await Promise.all([mkdir(source, { recursive: true }), mkdir(worktreeRoot), mkdir(bin)]);
   await writeFile(invocationFile, "");
   await writeFile(reportOverrideFile, "{}");
@@ -125,6 +126,7 @@ else if (args[0] === 'run') {
       ENGINEERING_TEAM_CONTROLLER_HOST: "127.0.0.1", ENGINEERING_TEAM_CONTROLLER_PORT: String(address.port),
       ENGINEERING_TEAM_WORKSPACE_ROOT: workspaceRoot, ENGINEERING_TEAM_WORKTREE_ROOT: worktreeRoot,
       ENGINEERING_TEAM_WORKTREE_VOLUME: "fixture-volume", ENGINEERING_TEAM_CODEX_AUTH_FILE: join(root, "no-auth.json"),
+      ENGINEERING_TEAM_CONTROLLER_TOKEN: fixtureToken,
       FIXTURE_API_KEY: "dummy-key", FIXTURE_INVOCATIONS: invocationFile, FIXTURE_RELEASE_PASSES: String(releasePasses),
       FIXTURE_COMMIT_WORKER_CHANGES: String(commitWorkerChanges),
       FIXTURE_SCENARIO: scenario, FIXTURE_FAIL_INITIAL_QA: String(failInitialQa), FIXTURE_TASK_ID: taskId,
@@ -159,7 +161,7 @@ else if (args[0] === 'run') {
   request.repositorySources = repositories.map(({ repositoryId, name, sourcePath }) => ({ repositoryId, name, sourcePath }));
   return {
     workspaceRoot, worktreeRoot, source, baseCommit, request, url, repositories,
-    executor: new HttpPlanningExecutor(url),
+    token: fixtureToken, executor: new HttpPlanningExecutor(url, fixtureToken),
     async setReportOverride(report: Record<string, unknown>, stage: "all" | "initial-qa" | "release" = "all") {
       await writeFile(reportOverrideFile, JSON.stringify({ report, stage }));
     },
@@ -289,12 +291,23 @@ test("malformed worker evidence is rejected before publishing source changes", c
 test("ambiguous or blank required criteria are rejected before starting a worker", controllerTest, async t => {
   const f = await controllerFixture(t);
   for (const acceptanceCriteria of [[], [" "], ["Works", "Works"], ["Works", " Works "]]) {
-    const response = await fetch(`${f.url}/task-runs`, { method: "POST", headers: { "content-type": "application/json" },
+    const response = await fetch(`${f.url}/task-runs`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${f.token}` },
       body: JSON.stringify({ ...f.request, run: { ...f.request.run, acceptanceCriteria } }),
     });
     assert.equal(response.status, 400, JSON.stringify(acceptanceCriteria));
   }
   assert.deepEqual(await f.invocations(), []);
+});
+
+test("the worker controller rejects missing or invalid shared-secret authentication", controllerTest, async t => {
+  const fixture = await controllerFixture(t);
+  const options = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(fixture.request) } as const;
+  const missing = await fetch(`${fixture.url}/task-runs`, options);
+  assert.equal((await missing.json() as { error: string }).error, "unauthorized");
+  const invalid = await fetch(`${fixture.url}/task-runs`, { ...options, headers: { ...options.headers, authorization: `Bearer ${randomUUID()}` } });
+  assert.equal((await invalid.json() as { error: string }).error, "unauthorized");
+  assert.deepEqual(await fixture.invocations(), []);
+  assert.deepEqual(await readdir(fixture.worktreeRoot), []);
 });
 
 async function startMultiRepositoryWorkflow(t: TestContext, fixture: Awaited<ReturnType<typeof controllerFixture>>) {
@@ -491,7 +504,7 @@ test("task metadata rejects invalid purposes, checks, and rounds before starting
     { runPurpos: "verification" }, { verificationRoud: 1 },
   ]) {
     const body = { ...fixture.request, run: { ...fixture.request.run, ...metadata } };
-    const response = await fetch(`${fixture.url}/task-runs`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const response = await fetch(`${fixture.url}/task-runs`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${fixture.token}` }, body: JSON.stringify(body) });
     assert.equal(response.status, 400, JSON.stringify(metadata));
     assert.equal((await response.json() as { error: string }).error, "invalid_task_run_request");
   }
@@ -578,7 +591,7 @@ test("read-only task requests cross HTTP validation and cannot publish changes, 
   const fixture = await controllerFixture(t);
   const invalid = structuredClone(fixture.request) as unknown as { run: { permissions: { filesystem: string } } };
   invalid.run.permissions.filesystem = "full-access";
-  const rejected = await fetch(`${fixture.url}/task-runs`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(invalid) });
+  const rejected = await fetch(`${fixture.url}/task-runs`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${fixture.token}` }, body: JSON.stringify(invalid) });
   assert.equal(rejected.status, 400);
   assert.deepEqual(await fixture.invocations(), []);
 

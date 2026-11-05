@@ -1146,8 +1146,8 @@ function SettingsView({ project, settings, contextDocument, revisions, saveConte
     <div className="settings-grid">
       <ContextEditor title="Project context" description="Shared knowledge about the product, architecture, repository relationships, conventions, deployment, and constraints." document={contextDocument} revisions={revisions} submitting={submitting} save={saveContext} />
       <form className="settings-card settings-card-wide" onSubmit={(event) => void saveExecutionDefaults(event)}>
-        <div className="settings-card-heading"><span>E</span><div><h3>Execution defaults</h3><p>Optional limits future agent runs will inherit unless a task provides tighter values.</p></div></div>
-        <div className="setup-field-grid"><label>Run timeout (minutes)<input type="number" min="0.5" max="1440" step="0.5" value={timeoutMinutes} onChange={(event) => setTimeoutMinutes(event.target.value)} required/></label><label>Retry attempts<select value={retries} onChange={(event) => setRetries(event.target.value)}><option value="0">No retries</option><option value="1">1 retry</option><option value="2">2 retries</option><option value="3">3 retries</option></select></label><label>Token budget <span>Optional</span><input type="number" min="1" max="10000000" value={tokenBudget} onChange={(event) => setTokenBudget(event.target.value)} placeholder="No project default"/></label><label>Cost budget in cents <span>Optional</span><input type="number" min="0.01" max="1000000" step="0.01" value={costBudget} onChange={(event) => setCostBudget(event.target.value)} placeholder="No project default"/></label></div>
+        <div className="settings-card-heading"><span>E</span><div><h3>Execution defaults</h3><p>Run timeout is enforced per worker attempt. Token and cost values are recorded for budget planning and reporting; they are not runtime spending limits.</p></div></div>
+        <div className="setup-field-grid"><label>Run timeout (minutes)<input type="number" min="0.5" max="1440" step="0.5" value={timeoutMinutes} onChange={(event) => setTimeoutMinutes(event.target.value)} required/></label><label>Fallback eligibility<input disabled value="Automatic provider fallback only" aria-label="Retry behavior"/><span>Configured provider failures can trigger one fallback attempt; ordinary execution failures do not retry automatically.</span></label><label>Token target <span>Recorded, not enforced</span><input type="number" min="1" max="10000000" value={tokenBudget} onChange={(event) => setTokenBudget(event.target.value)} placeholder="No project default"/></label><label>Cost target in cents <span>Recorded, not enforced</span><input type="number" min="0.01" max="1000000" step="0.01" value={costBudget} onChange={(event) => setCostBudget(event.target.value)} placeholder="No project default"/></label></div>
         <label>Planning network policy<select value={networkPolicy} onChange={(event) => setNetworkPolicy(event.target.value as PlanningNetworkPolicy)}><option value="model-provider-only">Model provider only — recommended</option><option value="restricted">Restricted allowlist</option><option value="offline">Offline</option></select></label>
         <div className="settings-lock"><span>✓</span><div><strong>Director plan approval required</strong><small>This safeguard remains enforced for every proposed plan.</small></div></div>
         <div className="settings-card-actions end"><button className="primary-button" type="submit" disabled={submitting}>Save defaults</button></div>
@@ -1783,6 +1783,11 @@ function TaskWorkflowPanel({ project, task, review, recovery, integrationProposa
   const [detail, setDetail] = useState<TaskWorkflowDetailResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setDetail(null);
+    setLoading(true);
+    setError(null);
+  }, [project.id, task.id]);
   useEffect(() => {
     function closeOnEscape(event: KeyboardEvent) { if (event.key === "Escape") close(); }
     window.addEventListener("keydown", closeOnEscape);

@@ -1982,6 +1982,13 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
     if (!options.taskExecutor) {
       return context.json({ error: "controller_unavailable", message: "The trusted task worker controller is not configured" } satisfies ApiError, 503);
     }
+    const taskSettings = database.getProjectSettings(projectId);
+    if (!taskSettings) {
+      return context.json({ error: "project_settings_not_found", message: "Project settings not found" } satisfies ApiError, 404);
+    }
+    if (taskSettings.planningNetworkPolicy !== "model-provider-only") {
+      return context.json({ error: "network_policy_not_supported", message: "Task execution currently requires the model-provider-only network policy" } satisfies ApiError, 409);
+    }
     if (!['ready', 'in_progress'].includes(task.status)) {
       return context.json({ error: "task_not_runnable", message: `Task cannot run while it is ${task.status}` } satisfies ApiError, 409);
     }
@@ -2065,10 +2072,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
     if (repositories.length === 0 || repositories.some((repository) => !repository?.enabled || !repository.available)) {
       return context.json({ error: "repository_unavailable", message: "Every task repository must be enabled and available before execution" } satisfies ApiError, 409);
     }
-    const settings = database.getProjectSettings(projectId);
-    if (!settings) {
-      return context.json({ error: "project_settings_not_found", message: "Project settings not found" } satisfies ApiError, 404);
-    }
+    const settings = taskSettings;
 
     const runId = randomUUID();
     const attemptId = randomUUID();

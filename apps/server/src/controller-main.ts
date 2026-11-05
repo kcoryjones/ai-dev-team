@@ -1,6 +1,8 @@
 import { execFile, spawn } from "node:child_process";
+import { timingSafeEqual } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { BedrockClient, ListFoundationModelsCommand, ListInferenceProfilesCommand } from "@aws-sdk/client-bedrock";
@@ -22,7 +24,8 @@ const worktreeRoot = resolve(process.env.ENGINEERING_TEAM_WORKTREE_ROOT ?? "/wor
 const applyCodingRun = createIntegrationApplier(workspaceRoot, join(worktreeRoot, ".integrations"));
 const workerImage = process.env.ENGINEERING_TEAM_WORKER_IMAGE ?? "local/engineering-team-controller:latest";
 const codexAuthFile = process.env.ENGINEERING_TEAM_CODEX_AUTH_FILE ?? "/run/secrets/codex-auth.json";
-const credentialStore = new CodexCredentialStore(join(worktreeRoot, ".provider-auth"));
+const controllerToken = process.env.ENGINEERING_TEAM_CONTROLLER_TOKEN;
+const credentialStore = new CodexCredentialStore(join(tmpdir(), "engineering-team-provider-auth"));
 const schemaPath = "/opt/engineering-team/plan-schema.json";
 const codingSchemaPath = "/opt/engineering-team/coding-result-schema.json";
 const consultationSchemaPath = "/opt/engineering-team/consultation-schema.json";
@@ -284,6 +287,9 @@ const modelBackendInspectionSchema = z.object({
 }).strict();
 
 const server = createServer(async (request, response) => {
+  if (!requestAuthorized(request)) {
+    return sendJson(response, 401, { error: "unauthorized", message: "Worker controller authentication is required" });
+  }
   if (request.method === "GET" && request.url === "/health") {
     return sendJson(response, 200, { status: "ok" });
   }
@@ -425,6 +431,15 @@ const server = createServer(async (request, response) => {
     return sendJson(response, 500, { error: "worker_failed", message });
   }
 });
+
+function requestAuthorized(request: import("node:http").IncomingMessage): boolean {
+  if (!controllerToken) return true;
+  const authorization = request.headers.authorization;
+  if (typeof authorization !== "string") return false;
+  const expected = Buffer.from(`Bearer ${controllerToken}`, "utf8");
+  const provided = Buffer.from(authorization, "utf8");
+  return expected.length === provided.length && timingSafeEqual(expected, provided);
+}
 
 async function inspectCapabilities(): Promise<{
   workerImage: string;
