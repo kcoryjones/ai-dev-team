@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "concurrently -n server,web -c cyan,magenta \"npm run dev -w @engineering-team/server\" \"npm run dev -w @engineering-team/web\"",
     "build": "npm run build -w @engineering-team/contracts && npm run build -w @engineering-team/database && npm run build -w @engineering-team/server && npm run build -w @engineering-team/web",
-    "test": "npm run test -w @engineering-team/database && npm run test -w @engineering-team/server",
+    "test": "npm run test -w @engineering-team/database && npm run test -w @engineering-team/server && npm run test -w @engineering-team/web",
     "typecheck": "npm run typecheck -w @engineering-team/contracts && npm run typecheck -w @engineering-team/database && npm run typecheck -w @engineering-team/server && npm run typecheck -w @engineering-team/web"
   },
   "devDependencies": {

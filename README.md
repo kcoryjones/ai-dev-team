@@ -50,11 +50,11 @@ The complete product direction is recorded in [ENGINEERING_TEAM_PLAN.md](ENGINEE
 - A production container that runs as a configurable non-root user
 - Docker-native build, test, typecheck, health check, and startup workflows
 
-Additional executable provider adapters, native Project Manager worker-event streaming, and voice are the next product layers. Conversations and planning remain read-only: agents can inspect isolated clones and advise or propose work, but they cannot change source code outside an approved task run.
+Additional executable provider adapters beyond OpenAI and Amazon Bedrock, native Project Manager worker-event streaming, and local spoken replies are the next product layers. Local voice supports wake-word capture, questions, reviewed work requests, task guidance, and standing instructions. Conversations and planning remain read-only: agents can inspect isolated clones and advise or propose work, but they cannot change source code outside an approved task run.
 
 ## Current execution boundary
 
-The settings UI can describe many harnesses and model providers, but configuration does not install or connect an adapter. End-to-end execution currently supports Codex with an OpenAI Responses backend using either a mounted ChatGPT `auth.json` or an API-key credential reference. Primary/fallback routing is operational for compatible connected runtimes; AWS Bedrock, Anthropic, RunPod, OpenCode, Pi, DeepSeek Harness, Grok Build, Ollama, and other entries remain configuration-only until their worker adapters are implemented.
+The settings UI can describe many harnesses and model providers, but configuration does not install or connect an adapter. End-to-end execution currently supports Codex with either an OpenAI Responses backend using a mounted ChatGPT `auth.json`/API-key credential reference or supported OpenAI models served by Amazon Bedrock using a named AWS profile. Primary/fallback routing works across those connected runtimes. Anthropic, RunPod, OpenCode, Pi, DeepSeek Harness, Grok Build, Ollama, and other entries remain configuration-only until their worker adapters are implemented.
 
 Worker containers request CPU, memory, and PID limits from Docker. Hosts without the required cgroup capabilities may warn that some limits cannot be enforced; review those warnings before relying on the installation for unattended or untrusted workloads. Endpoint-level network egress enforcement is also still future hardening.
 
@@ -90,9 +90,9 @@ Because Docker mounts the host parent folder at the generic `/workspaces` path, 
 
 On first launch, the application creates the workspace Project, derives its name from the parent workspace when that path is visible, automatically attaches every detected sibling Git repository, and opens directly into Live Team. You can rename the Project, create repositories, or adjust optional execution defaults later in Settings.
 
-Model Backends in Settings can record a ChatGPT-account backend without an API key, as well as API-key or unauthenticated local backends. Coding Harnesses independently register the CLIs that will drive those models and declare supported protocols and task capabilities. Each Live Team agent card directly selects its harness and model from two clickable lists in a compact popover; either choice may remain unassigned. These records intentionally store only configuration and environment-variable names—never key values or ChatGPT session tokens. The trusted controller currently verifies Codex against the actual allowlisted worker image; other harness registrations correctly show as missing until their images are implemented.
+Model Backends in Settings can record a ChatGPT-account backend without an API key, a named AWS profile for Amazon Bedrock, and API-key or unauthenticated local backends. Coding Harnesses independently register the CLIs that will drive those models and declare supported protocols and task capabilities. Each Live Team agent card directly selects its harness and model from two clickable lists in a compact popover; either choice may remain unassigned. These records intentionally store only configuration and credential references—never key values, temporary AWS credentials, or ChatGPT session tokens. The trusted controller currently verifies Codex against the actual allowlisted worker image; other harness registrations correctly show as missing until their images are implemented.
 
-The connected Codex adapter supports ChatGPT-session authentication or an API-key credential reference. Its planning flow is:
+The connected Codex adapter supports ChatGPT-session authentication, an API-key credential reference, or a named AWS profile for Bedrock. Its planning flow is:
 
 1. Open Live Team and select the Project Manager.
 2. Describe the feature or outcome you want.
@@ -103,13 +103,29 @@ The connected Codex adapter supports ChatGPT-session authentication or an API-ke
 7. If a required gate fails, the implementation agent receives the findings for one bounded repair pass and all required gates rerun. The same ticket stays in progress throughout; no review tickets are created.
 8. When every required gate passes, the Release Manager prepares an integration proposal. The Director can approve and apply it or reject it for rework. Dependencies become ready when the approved change is applied and the task completes.
 
-The Codex/OpenAI Responses adapter executes planning, consultations, and approved tasks today. Each participant resolves its harness and model from its Live Team assignment. A configured consultant must have a compatible enabled runtime before the Project Manager can request its input.
+The Codex adapter executes planning, consultations, and approved tasks through OpenAI Responses or Amazon Bedrock today. Each participant resolves its harness and model from its Live Team assignment. A configured consultant must have a compatible enabled runtime before the Project Manager can request its input.
 
 The controller image pins Codex with the `CODEX_VERSION` Docker build argument. Settings reports the installed CLI version only when a registered Codex harness uses the allowlisted worker image and a `codex` executable. A saved harness configuration does not install software by itself.
 
 Plans cannot execute before approval, invalid dependency graphs are rejected, and every decision and task transition is written to the audit log.
 
 Project Context is edited in Project Settings. Repository Context is edited from each repository's gear button. Both are durable Markdown shared with Project Manager, Architect, and Tech Lead planning runs. Direct edits create revisions immediately; agent-proposed replacements remain pending and are applied atomically only when their plan is approved.
+
+### Amazon Bedrock
+
+Expose the host AWS configuration directory to the trusted controller in `.env`:
+
+```bash
+AWS_CONFIG_DIR=/home/you/.aws
+```
+
+The controller mounts that directory read-only; agent containers never receive it. The controller resolves each run's named profile and signs model requests through a per-run provider proxy. AWS credentials remain in the controller; workers receive only the proxy socket and the configured Region. For an AWS IAM Identity Center profile, refresh the host session when necessary:
+
+```bash
+aws sso login --profile codex-bedrock
+```
+
+In Settings, add an **Amazon Bedrock** model backend, enter the profile name and Region, choose Runtime (recommended) or Mantle, and save it. **Discover models** loads compatible inference profiles for Runtime or foundation models for Mantle. **Test connection** verifies profile resolution, discovery permissions, Region availability, and the selected model. Assign the backend to an agent with the Codex harness just like a ChatGPT backend.
 
 On Linux, set these values in `.env` to the account that owns the repositories:
 
@@ -126,9 +142,50 @@ To expose a different collection of repositories, set an absolute or Compose-rel
 WORKSPACE_ROOT=/path/to/repositories
 ```
 
-Only repositories inside this root can be registered. The browser-facing service is loopback-only and does not receive the host Docker socket. A separate trusted controller receives the socket solely to create and destroy allowlisted workers. Each PM run clones the selected repositories into its own directory, mounts only that directory read-only, filters credentials from model-generated command environments, and destroys the worker and clone afterward.
+Only repositories inside this root can be registered. The browser-facing service is loopback-only and does not receive the host Docker socket. A separate trusted controller receives the socket solely to create and destroy allowlisted workers. Each PM run clones the selected repositories into its own directory, mounts it read-only, and destroys the worker and clone afterward.
+
+Planning, consultation, and coding workers use a per-run Unix socket to reach a provider proxy in the trusted controller. ChatGPT tokens, API keys, and AWS credentials never enter worker mounts or process environments. The worker's Codex home is an empty temporary filesystem. The proxy permits only model discovery, Responses, and compaction requests to the selected provider; it signs or authenticates requests in the controller, rejects redirects, and closes when the run ends. Refreshed ChatGPT tokens are cached in the controller-only `/worktrees/.provider-auth` directory with restricted permissions; replacing the configured host auth file starts a new credential cache. Repository commands can use their run's model proxy while it is active, so this boundary protects credentials but does not enforce a token or spending budget.
 
 ## Operate it
+
+### Local voice control (V1–V3)
+
+Start the optional voice profile on the developer's own machine:
+
+```bash
+docker compose --profile voice up --build --detach
+```
+
+The first build compiles pinned sherpa-onnx browser keyword spotting and whisper.cpp CPU transcription engines. Setup downloads a checksum-verified English `base.en` transcription model (148 MB) into the `engineering-team-speech-models` volume. Subsequent starts reuse it, including offline starts after the images and model have been installed. The speech runtime has no published port and runs on an internal Docker network without internet access. Model setup is the separate service allowed to download files.
+
+Open the app at <http://127.0.0.1:4318>, select **Enable voice**, and allow microphone access. Once it says **Listening for ‘Hey Dev Team’**, say the phrase followed by your request. Pause for about 1.2 seconds to finish; the request is limited to 30 seconds. The transcript appears below the voice controls. **Turn off microphone** stops capture and releases the microphone. Listening starts only through that button and requires the app to stay open.
+
+Say “Hey Dev Team. Architect, what is blocking progress?” to ask that agent, or “Hey Dev Team. What should we focus on?” to ask the Project Manager for the team. Clear questions are sent automatically. Unknown recipients or unclear wording open an editable question and recipient selector. Configure the recipient's Codex planning harness and supported OpenAI or Bedrock model first. Questions use a separate read-only worker with a timestamped snapshot of recorded tasks, dependencies, active runs, and pending approvals; they do not inspect a busy agent's live working copy. They cannot create plans, change standing directives or context, or interrupt tasks.
+
+Accepted question text and answers are saved in that agent's conversation history. Listening pauses while a question is being clarified or answered and resumes afterward. If the connection drops, **Retry question** reconnects using the same request ID, so a lost response does not create duplicate work. Terminal failed or cancelled questions are not restarted by retries. Each agent can answer one question at a time alongside its existing work. The text chat also provides **Ask question — work continues**; **Send guidance** explicitly stops and restarts the active stage.
+
+Work requests and instructions open an editable action form. **Review action** shows the exact recipient, instruction, and effect; a separate **Confirm** button applies that reviewed action. Examples:
+
+- “Hey Dev Team. Frontend, build a settings page.” requests a new plan from the Project Manager for the named role. It still requires plan approval before execution.
+- “Hey Dev Team. Backend, for your current task, keep the API backwards compatible.” selects task guidance. Review the running task before confirming; if its run changes after review, the request is rejected without interrupting the replacement.
+- “Hey Dev Team. Team, from now on always document relevant tests.” saves the instruction for all ten agents. Name an agent to restrict its scope. Instructions apply to future conversations and task stages, including verification and release; existing workers retain their original instructions.
+- “Hey Dev Team. Team, remove the instruction to always document relevant tests.” opens removal. Select the exact saved instruction and review its recipients before confirming.
+
+Standing instructions are saved without a model call. New work uses the existing Project Manager worker, and guidance uses the existing cancellation/recovery workflow. Integration approvals still apply. Retrying a lost response reuses the original action; it cannot save instructions twice, launch a second planner, or redirect a replacement run. Reviewed actions are stored on the server, with their ID remembered in the browser so a reload can restore the review or result. If the app restarts during dispatch, it marks the action interrupted and does not replay it automatically: inspect the conversation and task recovery before making another request. Guidance saved before an uncertain worker stop remains available through the task's Resume workflow control.
+
+Audio stays on the machine, is processed in memory, and is not saved to the database or recordings. Wake detection and transcription need no speech accounts, API keys, or cloud fallback. Accepted text goes to the agent's configured model provider, which may be remote. Unreviewed clarification drafts remain only in the current page. Reviewed actions and accepted text are durable. Turning off the microphone releases capture; an already accepted question continues and can be cancelled separately on the agent card.
+
+The initial implementation uses a fixed English wake phrase, an English transcription model, and a simple local silence threshold. Accents, microphone quality, background noise, and technical names need testing on your hardware; recognition is not guaranteed to be exact. GPU acceleration, spoken responses, adjustable microphone/sensitivity settings, and browser-closed listening are future work. See the **Voice milestones** in [the project plan](ENGINEERING_TEAM_PLAN.md#voice-milestones).
+
+To stop the speech service:
+
+```bash
+docker compose --profile voice stop speech
+```
+
+Audio unit tests and API regression tests run with `npm test`. An opt-in real browser/model smoke test is in `scripts/voice-browser-smoke.mjs`; it requires Playwright, a running isolated app with local speech enabled, and `VOICE_TEST_AUDIO` pointing to a WAV containing initial silence, “Hey Dev Team. Architect, what is blocking progress?”, and trailing silence. Set `VOICE_TEST_URL` to that app. This test blocks external browser requests, checks the real wake-to-transcript path, verifies exactly one routed question with a stubbed agent answer (no model-provider calls), and checks microphone cleanup. It supplements human microphone trials rather than measuring real-world wake accuracy. `scripts/voice-questions-browser-smoke.mjs` separately checks routing, clarification, history, lost-response retries, task visibility, and typed questions with deterministic speech inputs; use an isolated app with all roles configured, a running Backend Developer task, and a test consultation executor. After `npm run build`, start the supplied disposable fixture with `node scripts/voice-question-fixture.mjs`, then run `VOICE_TEST_URL=http://127.0.0.1:14318 node scripts/voice-questions-browser-smoke.mjs` with Playwright installed. Stop the fixture with Ctrl-C to remove its temporary database. `scripts/voice-commands-browser-smoke.mjs` uses that same fixture to check V3 review, confirmation, reload recovery, team/role directives, plan approval, and task guidance. These browser scripts do not call a paid agent model.
+
+### Service commands
 
 ```bash
 docker compose ps
@@ -147,7 +204,7 @@ The verification image contains all development dependencies, so tests require o
 docker compose --profile test run --rm test
 ```
 
-This runs the database and API tests, TypeScript typecheck, and production web/server build.
+This runs the database, API, and microphone audio tests, TypeScript typecheck, and production web/server build.
 
 ## Stop and update
 

@@ -735,6 +735,104 @@ const migrations: Migration[] = [
         ON agent_runtime_assignments(fallback_model_backend_id);
     `,
   },
+  {
+    version: 23,
+    name: "model_backend_provider_configuration",
+    sql: `
+      ALTER TABLE model_backends
+        ADD COLUMN configuration_json TEXT NOT NULL DEFAULT '{}';
+    `,
+  },
+  {
+    version: 24,
+    name: "durable_integration_applications",
+    sql: `
+      CREATE TABLE integration_applications (
+        approval_id TEXT PRIMARY KEY REFERENCES task_integration_proposals(approval_id) ON DELETE CASCADE,
+        request_json TEXT NOT NULL,
+        result_json TEXT,
+        status TEXT NOT NULL CHECK (status IN ('applying', 'retryable', 'applied')),
+        lease_token TEXT,
+        lease_expires_at TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    version: 25,
+    name: "superseded_integration_proposals",
+    sql: `
+      -- Keep the original decision and integration receipt as history. The public
+      -- status is superseded when this timestamp is set, regardless of that decision.
+      ALTER TABLE approval_requests ADD COLUMN superseded_at TEXT;
+      ALTER TABLE task_integration_proposals ADD COLUMN superseded_at TEXT;
+
+      UPDATE task_integration_proposals AS p SET superseded_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      WHERE NOT EXISTS (SELECT 1 FROM integration_applications a WHERE a.approval_id = p.approval_id AND a.status <> 'applied')
+        AND (
+          p.change_run_id <> (SELECT id FROM agent_runs WHERE project_id = p.project_id AND task_id = p.task_id
+            AND COALESCE(json_extract(run_spec_json, '$.runPurpose'), 'implementation') IN ('implementation', 'repair')
+            ORDER BY created_at DESC, rowid DESC LIMIT 1)
+          OR EXISTS (SELECT 1 FROM events requeue WHERE requeue.project_id = p.project_id AND requeue.entity_id = p.task_id
+            AND requeue.event_type = 'task.requeued' AND requeue.id > COALESCE((SELECT MAX(created.id) FROM events created
+              WHERE created.project_id = p.project_id AND created.entity_id = p.change_run_id AND created.event_type = 'agent.run_created'), 0))
+          OR p.release_run_id <> (SELECT ar.id FROM agent_runs ar WHERE ar.project_id = p.project_id AND ar.task_id = p.task_id
+            AND json_extract(ar.run_spec_json, '$.runPurpose') = 'release'
+            AND EXISTS (SELECT 1 FROM json_each(ar.run_spec_json, '$.upstreamArtifacts')
+              WHERE value = 'implementation-run:' || p.change_run_id)
+            ORDER BY ar.created_at DESC, ar.rowid DESC LIMIT 1)
+        );
+      UPDATE approval_requests SET superseded_at = (
+        SELECT p.superseded_at FROM task_integration_proposals p WHERE p.approval_id = approval_requests.id
+      ) WHERE id IN (SELECT approval_id FROM task_integration_proposals WHERE superseded_at IS NOT NULL);
+    `,
+  },
+  {
+    version: 26,
+    name: "interrupted_worker_cleanup",
+    sql: `
+      CREATE TABLE interrupted_worker_cleanups (
+        run_id TEXT PRIMARY KEY REFERENCES agent_runs(id) ON DELETE CASCADE,
+        requested_at TEXT NOT NULL
+      );
+    `,
+  },
+  {
+    version: 27,
+    name: "idempotent_agent_questions",
+    sql: `
+      CREATE TABLE agent_question_requests (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        request_id TEXT NOT NULL,
+        agent_role TEXT NOT NULL,
+        source TEXT NOT NULL CHECK(source IN ('voice', 'text')),
+        message_id TEXT NOT NULL UNIQUE REFERENCES agent_messages(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL UNIQUE REFERENCES agent_runs(id) ON DELETE CASCADE,
+        PRIMARY KEY(project_id, request_id)
+      );
+      CREATE INDEX agent_questions_role_idx ON agent_question_requests(project_id, agent_role);
+    `,
+  },
+  {
+    version: 28,
+    name: "reviewed_voice_commands",
+    sql: `
+      CREATE TABLE voice_commands (
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        request_id TEXT NOT NULL,
+        input_json TEXT NOT NULL,
+        preview_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('prepared', 'dispatching', 'applied', 'failed', 'interrupted')),
+        message TEXT NOT NULL,
+        run_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(project_id, request_id)
+      );
+    `,
+  },
 ];
 
 export function migrate(database: Database.Database): void {

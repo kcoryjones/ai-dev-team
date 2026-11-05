@@ -40,7 +40,7 @@ describe("TeamDatabase", () => {
     database.close();
   });
 
-  it("persists an approval-gated task graph and releases dependencies", () => {
+  it("persists an approval-gated task graph and blocks completion without execution evidence", () => {
     const database = new TeamDatabase(":memory:");
     database.createProject({
       id: "project-1",
@@ -97,20 +97,11 @@ describe("TeamDatabase", () => {
     assert.equal(state?.tasks.find((task) => task.id === "task-2")?.status, "blocked");
 
     database.updateTaskStatus("project-1", "task-1", "in_progress");
-    database.updateTaskStatus("project-1", "task-1", "review");
-    database.updateTaskStatus("project-1", "task-1", "completed");
+    assert.throws(() => database.updateTaskStatus("project-1", "task-1", "review"), /requires a successful completed run/);
+    assert.throws(() => database.updateTaskStatus("project-1", "task-1", "completed"), /cannot move/);
     state = database.getOrchestrationState("project-1");
-    assert.equal(state?.tasks.find((task) => task.id === "task-2")?.status, "ready");
-
-    database.updateTaskStatus("project-1", "task-2", "in_progress");
-    database.updateTaskStatus("project-1", "task-2", "review");
-    database.updateTaskStatus("project-1", "task-2", "completed");
-    state = database.getOrchestrationState("project-1");
-    assert.equal(state?.objectives[0]?.status, "completed");
-
-    database.requeueTask("project-1", "task-2");
-    state = database.getOrchestrationState("project-1");
-    assert.equal(state?.tasks.find((task) => task.id === "task-2")?.status, "ready");
+    assert.equal(state?.tasks.find((task) => task.id === "task-1")?.status, "in_progress");
+    assert.equal(state?.tasks.find((task) => task.id === "task-2")?.status, "blocked");
     assert.equal(state?.objectives[0]?.status, "active");
 
     const events = database.connection
@@ -118,10 +109,9 @@ describe("TeamDatabase", () => {
       .all("project-1") as Array<{ event_type: string }>;
     assert.ok(events.some((event) => event.event_type === "plan.created"));
     assert.ok(events.some((event) => event.event_type === "approval.decided"));
-    assert.ok(events.some((event) => event.event_type === "task.requeued"));
     assert.equal(
       events.filter((event) => event.event_type === "task.status_changed").length,
-      6,
+      1,
     );
 
     database.close();
@@ -281,7 +271,24 @@ describe("TeamDatabase", () => {
     assert.equal(updated.protocol, "openai-responses");
     assert.equal(updated.enabled, false);
 
+    const bedrock = database.createModelBackend("project-1", "backend-bedrock", {
+      name: "Bedrock Codex",
+      provider: "aws-bedrock",
+      protocol: "openai-responses",
+      model: "us.openai.example",
+      authMode: "aws-profile",
+      configuration: { awsProfile: "codex-bedrock", awsRegion: "us-east-2", bedrockEndpoint: "runtime" },
+    });
+    assert.equal(bedrock.provider, "aws-bedrock");
+    assert.equal(bedrock.authMode, "aws-profile");
+    assert.deepEqual(bedrock.configuration, { awsProfile: "codex-bedrock", awsRegion: "us-east-2", bedrockEndpoint: "runtime" });
+    const storedBedrock = database.connection.prepare("SELECT provider, auth_mode, configuration_json FROM model_backends WHERE id = ?").get("backend-bedrock") as { provider: string; auth_mode: string; configuration_json: string };
+    assert.equal(storedBedrock.provider, "openai");
+    assert.equal(storedBedrock.auth_mode, "none");
+    assert.equal(JSON.parse(storedBedrock.configuration_json).awsProfile, "codex-bedrock");
+
     database.deleteModelBackend("project-1", "backend-1");
+    database.deleteModelBackend("project-1", "backend-bedrock");
     assert.deepEqual(database.listModelBackends("project-1"), []);
     const eventTypes = database.connection
       .prepare("SELECT event_type FROM events WHERE project_id = ? ORDER BY id")

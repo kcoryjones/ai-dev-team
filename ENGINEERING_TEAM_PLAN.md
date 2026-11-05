@@ -52,14 +52,15 @@ The Docker-first Codex vertical slice is implemented and verified:
 - Installed, missing, and controller-unavailable harness status in Settings
 - Durable independent harness/model assignment for each role through compact clickable Live Team card popovers
 - Durable primary/fallback runtime assignment, classified automatic failover, visible fallback events, and manual failed-task fallback retry
+- Native Codex Amazon Bedrock execution using named AWS profiles, controller-resolved temporary credentials, model discovery, and backend preflight
 - Safe Director guidance that stops an active task worker, preserves its run history, and restarts the interrupted workflow stage with the new instruction
 - Append-only audit events for plan creation, approval decisions, and task transitions
 - Automated database and API tests using the Node test runner
 - Successful containerized tests, typecheck, production build, dependency audit, repository-write check, orchestration restart-persistence check, and live end-to-end smoke test
 
-Each engineering-team role can select a primary and fallback Coding Harness/Model Backend pair directly. Planning, consultation, conversation, implementation, verification, and release workers resolve those assignments at run time. Coding and consultation events are normalized, persisted, and shown live; Director cancellation stops disposable task or conversation workers, and task cancellation records a stage-aware recovery point. Native Project Manager worker-event streaming, non-Codex/non-OpenAI execution adapters, stronger egress enforcement, broader resource-limit enforcement, and expanded clean-install coverage remain future work.
+Each engineering-team role can select a primary and fallback Coding Harness/Model Backend pair directly. Planning, consultation, conversation, implementation, verification, and release workers resolve those assignments at run time. Coding and consultation events are normalized, persisted, and shown live; Director cancellation stops disposable task or conversation workers, and task cancellation records a stage-aware recovery point. Native Project Manager worker-event streaming, additional harness/provider adapters, stronger egress enforcement, broader resource-limit enforcement, and expanded clean-install coverage remain future work.
 
-The registry is intentionally broader than the connected execution layer. Codex with an OpenAI Responses backend is the only end-to-end adapter today. Entries for AWS Bedrock, Anthropic, RunPod, OpenCode, Pi, DeepSeek Harness, Grok Build, Ollama, and other services are configuration-only until their worker adapters and capability checks are implemented.
+The registry is intentionally broader than the connected execution layer. Codex with OpenAI Responses or Amazon Bedrock is executable end to end. Entries for Anthropic, RunPod, OpenCode, Pi, DeepSeek Harness, Grok Build, Ollama, and other services are configuration-only until their worker adapters and capability checks are implemented.
 
 ## Product vision
 
@@ -382,12 +383,22 @@ Required provider evaluations include:
 
 Voice will be an interface to the same command and event system used by text. It should not create a separate source of truth.
 
-The voice package should support interchangeable implementations:
+The application runs on the developer's own machine. Wake-word detection and speech-to-text must run locally, without cloud speech services or runtime accounts. Model files may be downloaded during installation and must be reusable offline. The agent's configured model backend receives text only.
 
-1. Cloud speech using a low-latency realtime speech provider.
-2. Local speech-to-text and text-to-speech for privacy or offline operation.
+The first version uses the browser microphone while the app is open, with an explicit listening toggle and the wake phrase “Hey Dev Team”. A browser keyword detector activates capture; a separate local speech service transcribes the request. Models remain loaded independently of disposable agent workers. Audio is transient; the interface displays the transcript and clearly distinguishes capture from command execution.
 
-The first version should use push-to-talk rather than an always-listening microphone. The interface should display the interpreted transcript and make it clear when a command has begun execution.
+### Voice milestones
+
+- [ ] **V1 — Local wake phrase and transcript preview (implemented; human microphone trial pending).** Package a CPU-compatible local transcription service and browser wake detector; persist downloaded model assets; provide enable/disable, listening/capturing/transcribing states, silence-based capture completion, and transcript preview. No agent actions in this milestone. Verify real model inference, bounded capture, microphone cleanup, unavailable-service errors, and offline operation after setup. Human microphone testing must establish wake accuracy and latency on the developer's hardware.
+- [x] **V2 — Team and individual-agent questions.** Resolve spoken role names and team requests, default team questions to the Project Manager, and persist accepted transcripts in existing conversation history. Separate non-interrupting status/questions from active-task redirection; ambiguous recipients or intent require clarification. Verify questions never stop a running task and each utterance is submitted only once.
+- [x] **V3 — Work and standing directives.** Route explicit new-work requests, active-task guidance, and role-specific or team-wide standing instructions through durable existing workflows. Preserve plan/integration approvals and show the interpreted recipient and action. Verify interrupted-work recovery and directives across restart.
+- [ ] **V4 — Conversation polish.** Add optional local spoken replies, follow-up context, interruption of speech playback, microphone selection, and noise/latency tuning. Prevent synthesized replies from activating the listener; test supported desktop browsers and CPU/GPU options. A desktop companion for browser-closed listening remains optional future scope.
+
+V1 verification (2026-11-04): all 222 regression tests, typechecking, and the production build passed. Real Chromium testing with locally generated natural speech exercised wake detection, capture, silence completion, local transcription, preview isolation, microphone stop, cancelled startup, and unavailable-service cleanup. The output was “Architect. What is blocking progress?”; the preview made one transcription request and no agent requests. The detector recognized its official recorded sample and the natural synthetic wake phrase, ignored the negative control, and missed an earlier robotic synthetic voice. These checks establish integration, not real-world wake accuracy. Cached model setup was tested with networking disabled; real transcription also passed inside the Compose service on its internal network. macOS, Windows, other browsers, accents, room noise, and real microphone latency still require trials.
+
+V2 verification (2026-11-05): all 233 regression tests (50 database, 175 server, 8 web), typechecking, and the production build passed. Questions for all ten roles use a separate read-only consultation, including the Project Manager. Tests cover active-task and lease preservation, durable request IDs and retry conflicts, receipts beyond recent-history limits, database reopening, cancellation and startup recovery, atomic creation, rejected directive/context changes, and bounded activity snapshots. The HTTP controller test verifies the question policy and snapshot reach the worker while source repositories remain unchanged. Real Chromium with deterministic speech inputs and a simulated agent executor verified named/team routing, clarification, saved history, lost-response retry deduplication, task visibility, typed questions, pause/resume, and microphone cleanup. The reusable fixture and browser scripts are in `scripts/`; they make no paid model calls. At the end of V2, V1's real microphone and recognition-accuracy trial remained pending, and V3 and V4 were not implemented.
+
+V3 verification (2026-11-05): all 247 regression tests (50 database, 188 server, 9 web), typechecking, and the production build passed. Reviewed voice actions reuse the existing Project Manager planning and task-redirection workflows, with exact recipient/task previews and explicit on-screen confirmation. Tests verify immutable reviews, concurrent/lost-response deduplication, atomic team-wide instruction updates, exact and stale removal, persistence across database reopening, task guidance bound to the reviewed run, uncertain-stop recovery, and no automatic replay after interrupted dispatch. Standing instructions now reach implementation, verification, repair, and release workers; HTTP controller tests verify instruction and planning-policy propagation. Chromium tests with deterministic speech and simulated workers pass for both V2 and V3, including reload recovery and unchanged plan/integration approval gates. The real local Compose app, controller, and speech service were started and passed health checks on port 4318. Chromium exercised the actual local wake detector and Whisper transcription using recorded natural synthetic speech; it produced “Architect. What is blocking progress?” and exactly one routed question. The answer was stubbed, so no paid provider calls were made. The existing database was backed up before startup. The human microphone trial remains pending; V4 remains future work.
 
 Voice alone must not authorize destructive or production-impacting operations. Those require explicit visible confirmation.
 
@@ -526,15 +537,17 @@ Roles can be split into their full specializations once the end-to-end workflow 
 
 - RunPod compatibility adapter if required
 - [x] Provider registry and secret-free credential references
-- [x] Role-based primary/fallback routing for the connected Codex/OpenAI adapter
+- [x] Codex Amazon Bedrock adapter with named-profile credentials, model discovery, and preflight
+- [x] Role-based primary/fallback routing across connected Codex/OpenAI and Codex/Bedrock backends
 - Model capability evaluation suite and preflight matrix
 - Cross-provider execution adapters and failover
 - Complete usage, latency, and cost reporting
 
 ### Milestone 4: Voice and richer interface
 
-- Push-to-talk input and spoken responses
-- Interruptible voice interaction
+- Local wake-word input and transcript preview (V1 above)
+- Spoken team/agent questions and directives (V2–V3 above)
+- Local spoken responses and interruptible voice interaction (V4 above)
 - [x] Direct conversation routing to specialists
 - Agent and dependency visualization
 - Diff, review, and approval interfaces
@@ -550,7 +563,7 @@ These decisions remain intentionally unresolved:
 4. Whether every plan requires director approval or only plans above a risk threshold.
 5. Initial OpenAI model assignments by role.
 6. Initial RunPod model and endpoint type.
-7. Cloud voice provider versus local speech stack for the first voice milestone.
+7. Local speech model size and supported hardware, selected by V1 measurements; cloud speech is excluded from the first voice milestones.
 8. Whether project configuration lives only in SQLite or also has a reviewable repository file.
 9. Authentication strategy if the server ever binds beyond loopback.
 

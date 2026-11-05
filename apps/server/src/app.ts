@@ -6,6 +6,7 @@ import type {
   AgentRuntimeAssignmentSummary,
   AgentConsultationResult,
   AgentRole,
+  AgentQuestionInput,
   ApiError,
   AssignAgentRuntimeInput,
   CodingHarnessInstallationSummary,
@@ -21,6 +22,8 @@ import type {
   CreateProjectInput,
   DecideApprovalInput,
   HealthResponse,
+  ModelBackendModelsResponse,
+  ModelBackendPreflightSummary,
   OrchestrationState,
   SaveCodingHarnessInput,
   SaveRuntimeProfileInput,
@@ -38,11 +41,15 @@ import type {
   UpdateAgentConfigurationInput,
   UpdateTaskStatusInput,
 } from "@engineering-team/contracts";
-import { agentRoles, runContractSchemaVersion } from "@engineering-team/contracts";
+import { agentRoles, reportOnlyTaskAgentRoles, runContractSchemaVersion } from "@engineering-team/contracts";
 import type { TeamDatabase } from "@engineering-team/database";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { z } from "zod";
+import { taskAcceptanceCriteriaSchema } from "./coding-result.js";
+import { createVoiceRoutes } from "./voice.js";
+import { registerVoiceCommands } from "./voice-commands.js";
+import { questionActivityContext } from "./question-context.js";
 import type { HarnessInspector, PlanningExecutor, TaskExecutor } from "./planning.js";
 import { createRepository, discoverRepositories, getRepositoryHead, inspectRepository, resolveRepositoryPath } from "./repository.js";
 
@@ -58,7 +65,7 @@ const validAgentRoles = [
   "security_reviewer",
   "release_manager",
 ] as const satisfies readonly AgentRole[];
-const reportOnlyTaskRoles = new Set<AgentRole>(["qa_engineer", "code_reviewer", "security_reviewer"]);
+const reportOnlyTaskRoles = new Set<AgentRole>(reportOnlyTaskAgentRoles);
 
 const createProjectSchema = z.object({
   name: z.string().trim().min(1).max(120),
@@ -90,7 +97,7 @@ const planTaskSchema = z.object({
   description: z.string().trim().max(2_000).default(""),
   assignedRole: z.enum(validAgentRoles),
   repositoryIds: z.array(z.string().uuid()).max(20).default([]),
-  acceptanceCriteria: z.array(z.string().trim().min(1).max(500)).min(1).max(20),
+  acceptanceCriteria: taskAcceptanceCriteriaSchema,
   requiredChecks: requiredChecksSchema,
   dependsOn: z.array(z.string().trim().min(1).max(60)).max(20),
 });
@@ -233,15 +240,20 @@ const modelBackendUrlSchema = z.string().trim().url().max(2_000).refine((value) 
 const saveModelBackendSchema = z
   .object({
     name: z.string().trim().min(1).max(120),
-    provider: z.enum(["openai", "anthropic", "runpod", "openrouter", "ollama", "custom"]),
+    provider: z.enum(["openai", "aws-bedrock", "anthropic", "runpod", "openrouter", "ollama", "custom"]),
     protocol: z.enum(["openai-responses", "openai-chat-completions", "anthropic-messages", "ollama"]),
     model: z.string().trim().min(1).max(160).optional(),
     baseUrl: modelBackendUrlSchema.optional(),
-    authMode: z.enum(["chatgpt", "api-key", "none"]),
+    authMode: z.enum(["chatgpt", "aws-profile", "api-key", "none"]),
     credentialRef: z.string().trim().min(2).max(128).regex(
       /^[A-Z][A-Z0-9_]*$/,
       "Credential reference must be an environment variable name",
     ).optional(),
+    configuration: z.object({
+      awsProfile: z.string().trim().min(1).max(128).optional(),
+      awsRegion: z.string().trim().regex(/^[a-z]{2}(?:-gov)?-[a-z]+-\d$/, "Enter a valid AWS Region").optional(),
+      bedrockEndpoint: z.enum(["runtime", "mantle"]).optional(),
+    }).strict().optional(),
     enabled: z.boolean().optional(),
   })
   .strict()
@@ -266,6 +278,25 @@ const saveModelBackendSchema = z
         path: ["authMode"],
         message: "ChatGPT workspace authentication is only available for OpenAI backends",
       });
+    }
+    if (backend.provider === "aws-bedrock") {
+      if (backend.authMode !== "aws-profile") {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ["authMode"], message: "Amazon Bedrock requires AWS profile authentication" });
+      }
+      if (backend.protocol !== "openai-responses") {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ["protocol"], message: "Codex uses the Responses protocol with Amazon Bedrock" });
+      }
+      if (!backend.configuration?.awsProfile) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ["configuration", "awsProfile"], message: "Amazon Bedrock requires an AWS profile name" });
+      }
+      if (!backend.configuration?.awsRegion) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ["configuration", "awsRegion"], message: "Amazon Bedrock requires an AWS Region" });
+      }
+      if (!backend.configuration?.bedrockEndpoint) {
+        context.addIssue({ code: z.ZodIssueCode.custom, path: ["configuration", "bedrockEndpoint"], message: "Choose a Bedrock endpoint" });
+      }
+    } else if (backend.authMode === "aws-profile") {
+      context.addIssue({ code: z.ZodIssueCode.custom, path: ["authMode"], message: "AWS profile authentication is only available for Amazon Bedrock" });
     }
     if (["runpod", "ollama", "custom"].includes(backend.provider) && !backend.baseUrl) {
       context.addIssue({
@@ -356,10 +387,12 @@ const startTaskRunSchema = z.object({
 
 const createAgentMessageSchema = z.object({
   body: z.string().trim().min(1).max(8_000),
+  planningOnly: z.boolean().optional(),
 });
 
 const redirectTaskSchema = z.object({
   guidance: z.string().trim().min(1).max(8_000),
+  expectedRunId: z.string().uuid().optional(),
 }).strict();
 
 const updateAgentConfigurationSchema = z.object({
@@ -408,6 +441,7 @@ export interface AppOptions {
   workspaceRoot: string;
   workspaceName?: string;
   staticRoot?: string;
+  speechUrl?: string;
   planningExecutor?: PlanningExecutor;
   taskExecutor?: TaskExecutor;
   harnessInspector?: HarnessInspector;
@@ -415,6 +449,7 @@ export interface AppOptions {
 
 export function createApp(database: TeamDatabase, options: AppOptions): Hono {
   const app = new Hono();
+  app.route("/api/voice", createVoiceRoutes(options.speechUrl));
 
   app.onError((error, context) => {
     console.error("Unhandled API error", error);
@@ -556,6 +591,34 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
       );
     }
     return context.json({ backends: database.listModelBackends(projectId) });
+  });
+
+  app.post("/api/projects/:projectId/model-backends/:backendId/preflight", async (context) => {
+    const projectId = context.req.param("projectId");
+    const backend = database.getModelBackend(projectId, context.req.param("backendId"));
+    if (!backend) return context.json({ error: "model_backend_not_found", message: "Model backend not found" } satisfies ApiError, 404);
+    if (!options.harnessInspector?.preflightModelBackend) {
+      return context.json({ preflight: { backendId: backend.id, state: "failed", message: "Worker controller is not configured for model backend checks" } satisfies ModelBackendPreflightSummary });
+    }
+    try {
+      return context.json({ preflight: await options.harnessInspector.preflightModelBackend(backend) });
+    } catch (error) {
+      return context.json({ preflight: { backendId: backend.id, state: "failed", message: error instanceof Error ? error.message : "Model backend preflight failed" } satisfies ModelBackendPreflightSummary });
+    }
+  });
+
+  app.post("/api/projects/:projectId/model-backends/:backendId/models", async (context) => {
+    const projectId = context.req.param("projectId");
+    const backend = database.getModelBackend(projectId, context.req.param("backendId"));
+    if (!backend) return context.json({ error: "model_backend_not_found", message: "Model backend not found" } satisfies ApiError, 404);
+    if (!options.harnessInspector?.discoverModelBackendModels) {
+      return context.json({ error: "controller_unavailable", message: "Worker controller is not configured for model discovery" } satisfies ApiError, 503);
+    }
+    try {
+      return context.json(await options.harnessInspector.discoverModelBackendModels(backend) satisfies ModelBackendModelsResponse);
+    } catch (error) {
+      return context.json({ error: "model_discovery_failed", message: error instanceof Error ? error.message : "Unable to discover models" } satisfies ApiError, 502);
+    }
   });
 
   app.post("/api/projects/:projectId/model-backends", async (context) => {
@@ -1060,7 +1123,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
         404,
       );
     }
-    return context.json({ state, reviews: buildTaskReviews(state, options.workspaceRoot) });
+    return context.json({ state, reviews: buildTaskReviews(database, state, options.workspaceRoot) });
   });
 
   app.get("/api/projects/:projectId/tasks/:taskId/workflow", (context) => {
@@ -1261,6 +1324,97 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
     }
   });
 
+  registerVoiceCommands(app, database, async command => {
+    const { projectId, input, preview } = command;
+    const endpoint = input.action === "new_work"
+      ? `/api/projects/${projectId}/agents/project_manager/messages`
+      : `/api/projects/${projectId}/tasks/${preview.taskId}/redirect`;
+    const body = input.action === "new_work"
+      ? { body: `New work requested for ${input.recipient === "team" ? "the team" : input.recipient.replaceAll("_", " ")}:\n\n${input.body}\n\nPropose work for Director approval, respecting the requested recipient. This is a new-work request, not active-task guidance or a standing-directive change.`, planningOnly: true }
+      : { guidance: input.body, expectedRunId: preview.expectedRunId };
+    const response = await app.request(endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    const result = await response.json() as { message?: unknown; run?: { id: string } };
+    if (!response.ok) throw new Error(typeof result.message === "string" ? result.message : "The action could not be dispatched. Check the conversation and task recovery.");
+    return { message: input.action === "new_work" ? "Sent to the Project Manager. Open the conversation to follow planning and review the proposed plan before approving it." : "Guidance saved and the interrupted task stage restarted. Existing approval gates still apply.", ...(result.run ? { runId: result.run.id } : {}) };
+  });
+
+  app.get("/api/projects/:projectId/questions/:requestId", (context) => {
+    const receipt = database.getAgentQuestionRequest(context.req.param("projectId"), context.req.param("requestId"));
+    if (!receipt) return context.json({ error: "question_not_found", message: "Question not found" }, 404);
+    context.header("Cache-Control", "no-store");
+    return context.json(receipt);
+  });
+
+  app.post("/api/projects/:projectId/agents/:agentRole/questions", async (context) => {
+    const projectId = context.req.param("projectId");
+    const role = context.req.param("agentRole") as AgentRole;
+    if (!validAgentRoles.includes(role)) return context.json({ error: "invalid_agent_role", message: "Unknown agent role" }, 400);
+    let body: AgentQuestionInput;
+    try { body = await context.req.json<AgentQuestionInput>(); } catch {
+      return context.json({ error: "invalid_json", message: "Request body must be valid JSON" }, 400);
+    }
+    const parsed = z.object({ requestId: z.string().uuid(), body: z.string().trim().min(1).max(2_000), source: z.enum(["voice", "text"]) }).strict().safeParse(body);
+    if (!parsed.success) return context.json({ error: "invalid_question", message: parsed.error.issues[0]?.message ?? "Invalid question" }, 400);
+    try {
+      const existing = database.getAgentQuestionRequest(projectId, parsed.data.requestId);
+      if (existing) {
+        if (existing.message.agentRole !== role || existing.message.body !== parsed.data.body || existing.source !== parsed.data.source) {
+          return context.json({ error: "question_conflict", message: "This request ID was already used for a different question." }, 409);
+        }
+        return context.json(existing, 200);
+      }
+      const state = database.getOrchestrationState(projectId);
+      if (!state) return context.json({ error: "project_not_found", message: "Project not found" }, 404);
+      if (!options.planningExecutor?.consult) return context.json({ error: "controller_unavailable", message: "The trusted consultation worker controller is not configured" }, 503);
+      const settings = database.getProjectSettings(projectId)!;
+      if (settings.planningNetworkPolicy !== "model-provider-only") return context.json({ error: "network_policy_not_supported", message: "Read-only questions require the model-provider-only network policy" }, 409);
+      const profile = resolveReadOnlyAgentProfile(database, projectId, role);
+      const messageId = randomUUID();
+      const runId = randomUUID();
+      const attemptId = randomUUID();
+      const repositories = state.project.repositories.filter(repository => repository.enabled && repository.available);
+      const run: ConsultationRunRequest["run"] = {
+        schemaVersion: runContractSchemaVersion, runId, projectId, agentRole: role, runPurpose: "consultation",
+        agentInstructions: state.agentConfigurations.find(configuration => configuration.agentRole === role)?.rolePrompt ?? "",
+        brainProfile: runtimeProfileRef(profile),
+        repositories: repositories.map((repository, index) => ({ repositoryId: repository.id,
+          checkoutPath: `/workspace/repos/${String(index + 1).padStart(2, "0")}-${repository.name.replace(/[^a-zA-Z0-9._-]/g, "-")}`,
+          baseCommit: getRepositoryHead(repository.relativePath, options.workspaceRoot),
+        })),
+        objective: parsed.data.body,
+        taskDescription: "Answer a question in a separate read-only conversation. Do not interrupt active work, create plans, change directives, or update project context.",
+        acceptanceCriteria: ["Answer the Director's question using recorded activity and available context", "Do not change work, standing directives, or project context"],
+        upstreamArtifacts: [`director-message:${messageId}`, `director-question:${messageId}`],
+        permissions: { filesystem: "read-only", networkPolicy: "model-provider-only", allowedTools: ["inspect_repository", "respond_to_request"] },
+        limits: { timeoutSeconds: settings.defaultRunTimeoutSeconds, retries: settings.defaultRunRetries,
+          ...(settings.defaultTokenBudget === null ? {} : { tokenBudget: settings.defaultTokenBudget }),
+          ...(settings.defaultCostBudgetCents === null ? {} : { costBudgetCents: settings.defaultCostBudgetCents }),
+        },
+      };
+      const receipt = database.createAgentQuestion({ requestId: parsed.data.requestId, source: parsed.data.source,
+        body: parsed.data.body, messageId, brainProfileId: profile.id, spec: run, attemptId });
+      if (!receipt.duplicate) {
+        appendRunEvent(database, runId, attemptId, 1, "run.queued", `${role.replaceAll("_", " ")} question queued`);
+        appendRunEvent(database, runId, attemptId, 2, "worker.provisioning", "Preparing a separate read-only question worker; active tasks continue");
+        const request: ConsultationRunRequest = {
+          run, requestingRole: "engineering_director", question: parsed.data.body, questionOnly: true,
+          activityContext: questionActivityContext(state),
+          directives: state.directives.filter(directive => directive.agentRole === role),
+          conversation: [...state.messages, receipt.message].filter(message => message.agentRole === role).slice(-20).map(({ author, body }) => ({ author, body })),
+          projectContext: state.contexts.find(document => document.repositoryId === null)?.content ?? "",
+          repositoryContexts: repositories.map(repository => ({ repositoryId: repository.id, name: repository.name,
+            content: state.contexts.find(document => document.repositoryId === repository.id)?.content ?? "" })),
+          repositorySources: repositories.map(repository => ({ repositoryId: repository.id, name: repository.name,
+            ...(repository.description ? { description: repository.description } : {}), sourcePath: resolveRepositoryPath(options.workspaceRoot, repository.relativePath) })),
+        };
+        void executeDirectorAgentConversation(database, options.planningExecutor, request, attemptId, messageId);
+      }
+      return context.json(receipt, receipt.duplicate ? 200 : 202);
+    } catch (error) {
+      return context.json({ error: "question_rejected", message: error instanceof Error ? error.message : "Unable to start a question" }, 409);
+    }
+  });
+
   app.post("/api/projects/:projectId/agents/:agentRole/messages", async (context) => {
     const role = context.req.param("agentRole") as AgentRole;
     if (!validAgentRoles.includes(role)) {
@@ -1321,9 +1475,9 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
           409,
         );
       }
-      if (harness.adapter !== "codex" || !harness.capabilities.includes("planning") || backend.provider !== "openai" || backend.protocol !== "openai-responses") {
+      if (harness.adapter !== "codex" || !harness.capabilities.includes("planning") || !["openai", "aws-bedrock"].includes(backend.provider) || backend.protocol !== "openai-responses") {
         return context.json(
-          { error: "adapter_not_connected", message: `The ${harness.name}/${backend.name} planning adapter is not connected yet; choose a Codex planning harness and OpenAI Responses model` } satisfies ApiError,
+          { error: "adapter_not_connected", message: `The ${harness.name}/${backend.name} planning adapter is not connected yet; choose a Codex planning harness and Responses-compatible model` } satisfies ApiError,
           409,
         );
       }
@@ -1335,7 +1489,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
       }
       const credentialRef = backend.authMode === "chatgpt"
         ? "CODEX_ACCESS_TOKEN"
-        : backend.credentialRef;
+        : backend.authMode === "aws-profile" ? "AWS_PROFILE" : backend.credentialRef;
       if (!credentialRef) {
         return context.json(
           { error: "authentication_not_configured", message: "The selected model backend does not identify a credential environment variable" } satisfies ApiError,
@@ -1357,6 +1511,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
           modelBackendId: backend.id,
           authMode: backend.authMode,
           protocol: backend.protocol,
+          ...backend.configuration,
           ...(backend.baseUrl ? { baseUrl: backend.baseUrl } : {}),
         },
       };
@@ -1371,7 +1526,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
         );
       }
       const state = database.getOrchestrationState(projectId);
-      if (state?.runs.some((run) => run.agentRole === role && ["queued", "provisioning", "running", "waiting"].includes(run.status))) {
+      if (database.listActiveAgentRuns(projectId, { agentRole: role }).length > 0) {
         return context.json(
           { error: "agent_busy", message: "The Project Manager is already working on a planning goal" } satisfies ApiError,
           409,
@@ -1406,14 +1561,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
         projectId,
         agentRole: role,
         agentInstructions: state?.agentConfigurations.find((configuration) => configuration.agentRole === role)?.rolePrompt ?? "",
-        brainProfile: {
-          provider: profile.provider,
-          harness: profile.harness,
-          modelClass: profile.modelClass,
-          credentialRef: profile.credentialRef,
-          ...(profile.model ? { model: profile.model } : {}),
-          ...(profile.reasoningLevel ? { reasoningLevel: profile.reasoningLevel } : {}),
-        },
+        brainProfile: runtimeProfileRef(profile),
         repositories: activeRepositories.map((repository, index) => ({
           repositoryId: repository.id,
           checkoutPath: `/workspace/repos/${String(index + 1).padStart(2, "0")}-${repository.name.replace(/[^a-zA-Z0-9._-]/g, "-")}`,
@@ -1446,6 +1594,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
       const request: PlanningRunRequest = {
         run: runSpec,
         directorMessageId: message.id,
+        ...(parsed.data.planningOnly ? { planningOnly: true } : {}),
         directives: (state?.directives ?? []).filter((directive) => directive.agentRole === role),
         conversation: [...(state?.messages ?? []), message]
           .filter((candidate) => candidate.agentRole === role)
@@ -1476,7 +1625,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
       const state = database.getOrchestrationState(projectId);
       const settings = database.getProjectSettings(projectId);
       if (!state || !settings) return context.json({ error: "project_settings_not_found", message: "Project settings not found" } satisfies ApiError, 404);
-      if (state.runs.some((run) => run.agentRole === role && ["queued", "provisioning", "running", "waiting"].includes(run.status))) {
+      if (database.listActiveAgentRuns(projectId, { agentRole: role }).length > 0) {
         return context.json({ error: "agent_busy", message: `The ${role.replaceAll("_", " ")} is already working` } satisfies ApiError, 409);
       }
       if (settings.planningNetworkPolicy !== "model-provider-only") {
@@ -1494,10 +1643,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
         agentRole: role,
         runPurpose: "consultation" as const,
         agentInstructions: state.agentConfigurations.find((configuration) => configuration.agentRole === role)?.rolePrompt ?? "",
-        brainProfile: {
-          provider: profile.provider, harness: profile.harness, modelClass: profile.modelClass, credentialRef: profile.credentialRef,
-          ...(profile.model ? { model: profile.model } : {}), ...(profile.reasoningLevel ? { reasoningLevel: profile.reasoningLevel } : {}),
-        },
+        brainProfile: runtimeProfileRef(profile),
         repositories: activeRepositories.map((repository, index) => ({
           repositoryId: repository.id,
           checkoutPath: `/workspace/repos/${String(index + 1).padStart(2, "0")}-${repository.name.replace(/[^a-zA-Z0-9._-]/g, "-")}`,
@@ -1769,18 +1915,41 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
       const approvalId = context.req.param("approvalId");
       const currentApproval = database.getApproval(projectId, approvalId);
       if (!currentApproval) throw new Error("Approval request not found");
-      let applied: Awaited<ReturnType<TaskExecutor["applyTask"]>> | null = null;
-      let appliedRunId: string | null = null;
       if (currentApproval.type === "integration" && parsed.data.decision === "approved") {
         if (!options.taskExecutor) throw new Error("The trusted task worker controller is not configured");
-        const proposal = database.getIntegrationProposal(projectId, approvalId);
-        if (!proposal) throw new Error("Integration proposal not found");
-        const state = database.getOrchestrationState(projectId);
-        const run = database.getAgentRun(proposal.changeRunId);
-        if (!state || !run?.result) throw new Error("The verified implementation for this proposal is unavailable");
-        const repositories = buildApplyRepositories(state, run, options.workspaceRoot);
-        applied = await options.taskExecutor.applyTask({ runId: run.id, taskId: proposal.taskId, repositories });
-        appliedRunId = run.id;
+        const leaseToken = randomUUID();
+        const leaseExpiry = () => new Date(Date.now() + 60_000).toISOString();
+        const claim = database.claimIntegrationApplication(projectId, approvalId, parsed.data.note || null, () => {
+          const proposal = database.getIntegrationProposal(projectId, approvalId)!;
+          const state = database.getOrchestrationState(projectId);
+          const run = database.getAgentRun(proposal.changeRunId);
+          if (!state || !run?.result) throw new Error("The verified implementation for this proposal is unavailable");
+          return { approvalId, runId: run.id, taskId: proposal.taskId,
+            repositories: buildApplyRepositories(state, run, options.workspaceRoot) };
+        }, leaseToken, leaseExpiry());
+        let applied = claim.result;
+        if (!applied) {
+          const heartbeat = setInterval(() => {
+            try {
+              database.renewIntegrationApplication(approvalId, leaseToken, leaseExpiry());
+            } catch {
+              // Let the durable lease expire if storage becomes unavailable. Completion
+              // still checks ownership, and a new owner resumes the same controller receipt.
+              clearInterval(heartbeat);
+            }
+          }, 10_000);
+          heartbeat.unref();
+          try {
+            applied = await options.taskExecutor.applyTask(claim.request);
+            database.completeIntegrationApplication(projectId, approvalId, leaseToken, applied);
+          } catch (error) {
+            database.failIntegrationApplication(approvalId, leaseToken, error instanceof Error ? error.message : "Integration interrupted");
+            throw error;
+          } finally {
+            clearInterval(heartbeat);
+          }
+        }
+        return context.json({ approval: database.getApproval(projectId, approvalId), applied: applied.applied });
       }
       const approval = database.decideApproval(
         projectId,
@@ -1788,18 +1957,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
         parsed.data.decision,
         parsed.data.note || null,
       );
-      if (applied && appliedRunId && currentApproval.taskId) {
-        database.markRunBranchesApplied(appliedRunId, applied.applied.map((item) => item.branch));
-        database.markIntegrationProposalApplied(projectId, approvalId);
-        const state = database.getOrchestrationState(projectId);
-        const task = state?.tasks.find((candidate) => candidate.id === currentApproval.taskId);
-        if (task?.status === "review") database.updateTaskStatus(projectId, task.id, "completed");
-        database.createAgentMessage({
-          id: randomUUID(), projectId, agentRole: "release_manager", author: "system",
-          body: `Director approved integration. Applied ${applied.applied.map((item) => `${item.branch} to ${item.targetBranch}`).join(", ")}.`,
-        });
-      }
-      return context.json({ approval, ...(applied ? { applied: applied.applied } : {}) });
+      return context.json({ approval });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to decide approval";
       return context.json(
@@ -1827,7 +1985,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
     if (!['ready', 'in_progress'].includes(task.status)) {
       return context.json({ error: "task_not_runnable", message: `Task cannot run while it is ${task.status}` } satisfies ApiError, 409);
     }
-    if (state.runs.some((run) => run.taskId === taskId && ["queued", "provisioning", "running", "waiting"].includes(run.status))) {
+    if (database.listActiveAgentRuns(projectId, { taskId }).length > 0) {
       return context.json({ error: "task_busy", message: "This task already has an active agent run" } satisfies ApiError, 409);
     }
     let startInput: z.infer<typeof startTaskRunSchema> = {};
@@ -1859,10 +2017,10 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
     if (!harness.supportedProtocols.includes(backend.protocol)) {
       return context.json({ error: "runtime_incompatible", message: `${harness.name} does not support the ${backend.protocol} model protocol` } satisfies ApiError, 409);
     }
-    if (harness.adapter !== "codex" || !harness.capabilities.includes("coding") || backend.provider !== "openai" || backend.protocol !== "openai-responses") {
-      return context.json({ error: "adapter_not_connected", message: "Task execution currently requires a Codex harness with an OpenAI model backend" } satisfies ApiError, 409);
+    if (harness.adapter !== "codex" || !harness.capabilities.includes("coding") || !["openai", "aws-bedrock"].includes(backend.provider) || backend.protocol !== "openai-responses") {
+      return context.json({ error: "adapter_not_connected", message: "Task execution currently requires a Codex harness with a Responses-compatible model backend" } satisfies ApiError, 409);
     }
-    const credentialRef = backend.authMode === "chatgpt" ? "CODEX_ACCESS_TOKEN" : backend.credentialRef;
+    const credentialRef = backend.authMode === "chatgpt" ? "CODEX_ACCESS_TOKEN" : backend.authMode === "aws-profile" ? "AWS_PROFILE" : backend.credentialRef;
     if (!credentialRef) {
       return context.json({ error: "authentication_not_configured", message: "The assigned model does not have an authentication method" } satisfies ApiError, 409);
     }
@@ -1896,6 +2054,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
         modelBackendId: backend.id,
         authMode: backend.authMode,
         protocol: backend.protocol,
+        ...backend.configuration,
         ...(backend.baseUrl ? { baseUrl: backend.baseUrl } : {}),
       },
     };
@@ -1915,16 +2074,18 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
     const attemptId = randomUUID();
     const leaseToken = randomUUID();
     const workflowRecovery = database.getTaskWorkflowRecovery(projectId, taskId);
-    const rejectedIntegration = state.integrationProposals.find((proposal) => proposal.taskId === taskId && proposal.status === "rejected");
-    const rejectedIntegrationApproval = rejectedIntegration
-      ? state.approvals.find((approval) => approval.id === rejectedIntegration.approvalId)
-      : undefined;
-    const priorChangeRun = (task.status === "in_progress" || Boolean(rejectedIntegration))
-      ? state.runs.find((candidate) => candidate.taskId === taskId && candidate.status === "completed" && candidate.result?.status === "completed" && candidate.result.commits.length > 0 && ["implementation", "repair"].includes(candidate.spec.runPurpose ?? "implementation"))
-      : undefined;
+    const workflow = database.getTaskWorkflowContext(projectId, taskId);
+    const rejectedRun = workflow.rejectedChangeRunId ? database.getAgentRun(workflow.rejectedChangeRunId) : null;
+    const repairCandidate = workflow.runs.find(candidate => candidate.status === "completed" && candidate.result?.status === "completed" && candidate.result.commits.length > 0 && ["implementation", "repair"].includes(candidate.spec.runPurpose ?? "implementation")) ?? rejectedRun;
+    // Reuse rejected work only while its integration base still matches the source.
+    // A stale rerun and retries before its first success start from the new source base.
+    const priorChangeRun = repairCandidate?.result?.status === "completed" && repairCandidate.spec.repositories.every(runRepository => {
+      const repository = project.repositories.find(candidate => candidate.id === runRepository.repositoryId);
+      return repository && getRepositoryHead(repository.relativePath, options.workspaceRoot) === (runRepository.integrationBaseCommit ?? runRepository.baseCommit);
+    }) ? repairCandidate : undefined;
     const priorCommitByRepository = new Map(priorChangeRun?.result?.commits.map((commit) => [commit.repositoryId, commit.sha]) ?? []);
     const failedVerificationRuns = priorChangeRun
-      ? state.runs.filter((candidate) => candidate.taskId === taskId && candidate.spec.runPurpose === "verification" && candidate.spec.upstreamArtifacts.includes(`implementation-run:${priorChangeRun.id}`) && candidate.result?.status !== "completed")
+      ? workflow.runs.filter((candidate) => candidate.spec.runPurpose === "verification" && candidate.spec.upstreamArtifacts.includes(`implementation-run:${priorChangeRun.id}`) && candidate.result?.status !== "completed")
       : [];
     const verificationRound = priorChangeRun ? (priorChangeRun.spec.verificationRound ?? 0) + 1 : 0;
     const runSpec = {
@@ -1936,15 +2097,9 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
       runPurpose: priorChangeRun ? "repair" as const : "implementation" as const,
       verificationRound,
       agentInstructions: state.agentConfigurations.find((configuration) => configuration.agentRole === task.assignedRole)?.rolePrompt ?? "",
+      standingDirectives: database.getAgentStandingDirectives(state.project.id, task.assignedRole),
       ...(workflowRecovery?.guidance ? { directorGuidance: workflowRecovery.guidance } : {}),
-      brainProfile: {
-        provider: profile.provider,
-        harness: profile.harness,
-        modelClass: profile.modelClass,
-        credentialRef: profile.credentialRef,
-        ...(profile.model ? { model: profile.model } : {}),
-        ...(profile.reasoningLevel ? { reasoningLevel: profile.reasoningLevel } : {}),
-      },
+      brainProfile: runtimeProfileRef(profile),
       repositories: repositories.map((repository, index) => ({
         repositoryId: repository!.id,
         checkoutPath: `/workspace/repos/${String(index + 1).padStart(2, "0")}-${repository!.name.replace(/[^a-zA-Z0-9._-]/g, "-")}`,
@@ -1955,9 +2110,9 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
       taskDescription: priorChangeRun
         ? `${task.title}\n\nRepair the current implementation in response to these blocking findings:\n${[
           ...failedVerificationRuns.map((candidate) => `- ${candidate.spec.verificationCheck?.replaceAll("_", " ")}: ${candidate.result?.summary}`),
-          ...(rejectedIntegrationApproval?.decisionNote ? [`- Director integration feedback: ${rejectedIntegrationApproval.decisionNote}`] : []),
+          ...(workflow.directorFeedback ? [`- Director integration feedback: ${workflow.directorFeedback}`] : []),
         ].join("\n") || "- Re-run the implementation carefully and address the unresolved workflow findings."}`
-        : `${task.title}\n\n${task.description}`.trim(),
+        : `${task.title}\n\n${task.description}${workflow.directorFeedback ? `\n\nDirector integration feedback: ${workflow.directorFeedback}` : ""}`.trim(),
       acceptanceCriteria: task.acceptanceCriteria,
         upstreamArtifacts: priorChangeRun ? [`implementation-run:${priorChangeRun.id}`] : [],
       permissions: {
@@ -2019,14 +2174,13 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
       return context.json({ error: "resume_with_agent", message: "Resume this implementation or repair through the task run endpoint" } satisfies ApiError, 409);
     }
     if (!options.taskExecutor) return context.json({ error: "controller_unavailable", message: "The trusted task worker controller is not configured" } satisfies ApiError, 503);
-    if (state.runs.some((run) => run.taskId === taskId && ["queued", "provisioning", "running", "waiting"].includes(run.status))) {
+    if (database.listActiveAgentRuns(projectId, { taskId }).length > 0) {
       return context.json({ error: "task_busy", message: "This task already has an active agent run" } satisfies ApiError, 409);
     }
     const interruptedRun = database.getAgentRun(recovery.interruptedRunId);
     const referencedBaselineId = interruptedRun?.spec.upstreamArtifacts.find((artifact) => artifact.startsWith("implementation-run:"))?.slice("implementation-run:".length);
-    const baseline = (referencedBaselineId ? database.getAgentRun(referencedBaselineId) : null)
-      ?? database.listAgentRunsForTask(projectId, taskId).find((candidate) => candidate.status === "completed" && candidate.result?.status === "completed" && candidate.result.commits.length > 0 && ["implementation", "repair"].includes(candidate.spec.runPurpose ?? "implementation"));
-    if (!baseline?.result) return context.json({ error: "recovery_baseline_missing", message: "The completed implementation commit needed to resume verification is unavailable" } satisfies ApiError, 409);
+    const baseline = database.getTaskWorkflowContext(projectId, taskId).runs.find(candidate => ["implementation", "repair"].includes(candidate.spec.runPurpose ?? "implementation"));
+    if (baseline?.status !== "completed" || baseline.result?.status !== "completed" || !baseline.result.commits.length || (referencedBaselineId && baseline.id !== referencedBaselineId)) return context.json({ error: "recovery_baseline_missing", message: "The completed implementation commit needed to resume verification is unavailable" } satisfies ApiError, 409);
     try {
       for (const role of [
         ...(task.requiredChecks.qa ? ["qa_engineer" as const] : []),
@@ -2093,7 +2247,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
     const task = state?.tasks.find((candidate) => candidate.id === taskId);
     if (!state) return context.json({ error: "project_not_found", message: "Project not found" } satisfies ApiError, 404);
     if (!task) return context.json({ error: "task_not_found", message: "Task not found" } satisfies ApiError, 404);
-    const run = state.runs.find((candidate) => candidate.taskId === taskId && ["queued", "provisioning", "running", "waiting"].includes(candidate.status));
+    const run = database.listActiveAgentRuns(projectId, { taskId })[0];
     if (!run) return context.json({ error: "active_run_not_found", message: "This task has no active agent run to cancel" } satisfies ApiError, 409);
     if (!options.taskExecutor?.stopTaskWorker) return context.json({ error: "controller_unavailable", message: "The trusted worker controller cannot cancel this run" } satisfies ApiError, 503);
     try {
@@ -2125,8 +2279,9 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
     const task = state?.tasks.find((candidate) => candidate.id === taskId);
     if (!state) return context.json({ error: "project_not_found", message: "Project not found" } satisfies ApiError, 404);
     if (!task) return context.json({ error: "task_not_found", message: "Task not found" } satisfies ApiError, 404);
-    const run = state.runs.find((candidate) => candidate.taskId === taskId && ["queued", "provisioning", "running", "waiting"].includes(candidate.status));
+    const run = database.listActiveAgentRuns(projectId, { taskId })[0];
     if (!run) return context.json({ error: "active_run_not_found", message: "This task has no active run to redirect" } satisfies ApiError, 409);
+    if (parsed.data.expectedRunId && parsed.data.expectedRunId !== run.id) return context.json({ error: "stale_guidance", message: "The running task changed since review. Review fresh guidance before redirecting it." } satisfies ApiError, 409);
     if (!options.taskExecutor?.stopTaskWorker) return context.json({ error: "controller_unavailable", message: "The trusted worker controller cannot redirect this run" } satisfies ApiError, 503);
     try {
       const reason = "Redirected by the Engineering Director. Recorded activity was preserved and the interrupted stage will restart with new guidance.";
@@ -2186,7 +2341,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
     if (!task) {
       return context.json({ error: "task_not_found", message: "Task not found" } satisfies ApiError, 404);
     }
-    const review = buildTaskReviews(state, options.workspaceRoot).find((candidate) => candidate.taskId === taskId);
+    const review = buildTaskReviews(database, state, options.workspaceRoot).find((candidate) => candidate.taskId === taskId);
     const rejectedIntegration = state.integrationProposals.find((proposal) => proposal.taskId === taskId && proposal.status === "rejected");
     if (review?.state !== "stale" && !rejectedIntegration) {
       return context.json({ error: "task_not_rerunnable", message: "Only a stale or rejected integration can be re-run" } satisfies ApiError, 409);
@@ -2218,20 +2373,6 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
     }
 
     try {
-      if (parsed.data.status === "completed") {
-        const state = database.getOrchestrationState(context.req.param("projectId"));
-        const review = state
-          ? buildTaskReviews(state, options.workspaceRoot).find((candidate) => candidate.taskId === context.req.param("taskId"))
-          : undefined;
-        if (review && ["applicable", "stale"].includes(review.state)) {
-          return context.json({
-            error: "task_changes_not_applied",
-            message: review.state === "stale"
-              ? "This task is stale and must be re-run on the current branch"
-              : "Apply the reviewed branch before completing this task",
-          } satisfies ApiError, 409);
-        }
-      }
       const task = database.updateTaskStatus(
         context.req.param("projectId"),
         context.req.param("taskId"),
@@ -2313,6 +2454,7 @@ async function executeProjectManagerPlanning(
       managerResponse = parsedResponse.data;
       if (managerResponse.intent === "consultation") throw new Error("Project Manager requested another consultation round instead of finalizing its response");
     }
+    if (request.planningOnly && managerResponse.directiveActions.length) throw new Error("New-work planning cannot change standing directives");
     const activeDirectiveIds = new Set(request.directives.map((directive) => directive.id));
     for (const action of managerResponse.directiveActions) {
       if (action.action === "remove" && !activeDirectiveIds.has(action.directiveId)) {
@@ -2454,14 +2596,7 @@ async function executeAgentConsultation(
     projectId: planningRequest.run.projectId,
     agentRole,
     agentInstructions: state.agentConfigurations.find((configuration) => configuration.agentRole === agentRole)?.rolePrompt ?? "",
-    brainProfile: {
-      provider: profile.provider,
-      harness: profile.harness,
-      modelClass: profile.modelClass,
-      credentialRef: profile.credentialRef,
-      ...(profile.model ? { model: profile.model } : {}),
-      ...(profile.reasoningLevel ? { reasoningLevel: profile.reasoningLevel } : {}),
-    },
+    brainProfile: runtimeProfileRef(profile),
     repositories: planningRequest.run.repositories,
     objective: planningRequest.run.objective,
     taskDescription: question,
@@ -2556,12 +2691,15 @@ async function executeDirectorAgentConversation(
     appendRunEvent(database, run.runId, attemptId, 3, "worker.started", "Disposable read-only conversation worker started");
     appendRunEvent(database, run.runId, attemptId, 4, "harness.connected", "Agent conversation harness connected");
     const execution = await executeConsultationWithRuntimeFallback(database, executor, request, attemptId, (event) => {
-      if (database.getAgentRun(run.runId)?.status !== "cancelled") {
+      if (["queued", "provisioning", "running", "waiting"].includes(database.getAgentRun(run.runId)?.status ?? "")) {
         appendNextRunEvent(database, run.runId, attemptId, event.type, event.message, event.payload, event.createdAt);
       }
     });
     const { response } = execution;
+    if (!["queued", "provisioning", "running", "waiting"].includes(database.getAgentRun(run.runId)?.status ?? "")) return;
+    if (typeof response.response !== "string" || !response.response.trim() || response.response.length > 8_000) throw new Error("Agent returned an invalid answer");
     if (response.contextUpdates.length > 0) throw new Error("Direct agent conversations cannot update project context");
+    if (request.questionOnly && (response.directiveActions?.length ?? 0) > 0) throw new Error("Question answers cannot change standing directives");
     const parsedDirectiveActions = z.array(directiveActionSchema).max(20).safeParse(response.directiveActions ?? []);
     if (!parsedDirectiveActions.success) throw new Error(parsedDirectiveActions.error.issues[0]?.message ?? "Agent returned invalid directive changes");
     const directiveActions = parsedDirectiveActions.data;
@@ -2592,7 +2730,7 @@ async function executeDirectorAgentConversation(
     appendNextRunEvent(database, run.runId, attemptId, "agent.message", `${run.agentRole.replaceAll("_", " ")} replied`);
     appendNextRunEvent(database, run.runId, attemptId, "run.completed", "Agent conversation completed");
   } catch (error) {
-    if (database.getAgentRun(run.runId)?.status === "cancelled") return;
+    if (!["queued", "provisioning", "running", "waiting"].includes(database.getAgentRun(run.runId)?.status ?? "")) return;
     const message = error instanceof Error ? error.message : "Agent conversation failed";
     try {
       database.completeAgentRun(run.runId, attemptId, {
@@ -2618,10 +2756,10 @@ function resolveReadOnlyAgentProfile(database: TeamDatabase, projectId: string, 
   const backend = database.getModelBackend(projectId, backendId);
   if (!harness || !backend || !harness.enabled || !backend.enabled) throw new Error(`The ${agentRole.replaceAll("_", " ")} conversation runtime is missing or disabled`);
   if (!harness.supportedProtocols.includes(backend.protocol)) throw new Error(`${harness.name} does not support the ${backend.protocol} model protocol`);
-  if (harness.adapter !== "codex" || !harness.capabilities.includes("planning") || backend.provider !== "openai" || backend.protocol !== "openai-responses") {
-    throw new Error(`${agentRole.replaceAll("_", " ")} conversations currently require a Codex planning harness and OpenAI Responses model`);
+  if (harness.adapter !== "codex" || !harness.capabilities.includes("planning") || !["openai", "aws-bedrock"].includes(backend.provider) || backend.protocol !== "openai-responses") {
+    throw new Error(`${agentRole.replaceAll("_", " ")} conversations currently require a Codex planning harness and Responses-compatible model`);
   }
-  const credentialRef = backend.authMode === "chatgpt" ? "CODEX_ACCESS_TOKEN" : backend.credentialRef;
+  const credentialRef = backend.authMode === "chatgpt" ? "CODEX_ACCESS_TOKEN" : backend.authMode === "aws-profile" ? "AWS_PROFILE" : backend.credentialRef;
   if (!credentialRef) throw new Error(`The ${agentRole.replaceAll("_", " ")} model does not have an authentication method`);
   const record = {
     id: selection === "primary" ? `runtime-${projectId}-${agentRole}` : `runtime-fallback-${projectId}-${agentRole}`,
@@ -2632,20 +2770,21 @@ function resolveReadOnlyAgentProfile(database: TeamDatabase, projectId: string, 
     modelClass: "planning",
     credentialRef,
     ...(backend.model ? { model: backend.model } : {}),
-    configuration: { source: "agent_runtime_assignment", selection, codingHarnessId: harness.id, modelBackendId: backend.id, authMode: backend.authMode, protocol: backend.protocol, ...(backend.baseUrl ? { baseUrl: backend.baseUrl } : {}) },
+    configuration: { source: "agent_runtime_assignment", selection, codingHarnessId: harness.id, modelBackendId: backend.id, authMode: backend.authMode, protocol: backend.protocol, ...backend.configuration, ...(backend.baseUrl ? { baseUrl: backend.baseUrl } : {}) },
   };
   return database.getBrainProfile(record.id) ? database.updateBrainProfile(record) : database.createBrainProfile(record);
 }
 
-function buildTaskReviews(state: OrchestrationState, workspaceRoot: string): TaskReviewSummary[] {
+function buildTaskReviews(database: TeamDatabase, state: OrchestrationState, workspaceRoot: string): TaskReviewSummary[] {
   const reviews: TaskReviewSummary[] = [];
   for (const task of state.tasks) {
     if (!['review', 'completed'].includes(task.status)) continue;
-    const changeRun = state.runs.find((candidate) =>
+    const { runs } = database.getTaskWorkflowContext(state.project.id, task.id);
+    const changeRun = runs.find((candidate) =>
       candidate.taskId === task.id && candidate.status === "completed" && candidate.result?.status === "completed" && candidate.result.commits.length > 0 && ["implementation", "repair"].includes(candidate.spec.runPurpose ?? "implementation")
     );
     const reportRun = task.status === "completed"
-      ? state.runs.find((candidate) =>
+      ? runs.find((candidate) =>
         candidate.taskId === task.id && candidate.status === "completed" && candidate.result?.status === "completed" && candidate.result.commits.length === 0 && candidate.spec.runPurpose !== "verification" && reportOnlyTaskRoles.has(candidate.agentRole)
       )
       : undefined;
@@ -2706,18 +2845,38 @@ function buildApplyRepositories(
 ): ApplyCodingRunRequest["repositories"] {
   if (!run.taskId || !run.result?.commits.length) throw new Error("The reviewed run has no changes to integrate");
   const commitByRepository = new Map(run.result.commits.map((commit) => [commit.repositoryId, commit.sha]));
-  return run.spec.repositories.map((runRepository) => {
+  return run.spec.repositories.flatMap((runRepository) => {
     const repository = state.project.repositories.find((candidate) => candidate.id === runRepository.repositoryId);
     const sha = commitByRepository.get(runRepository.repositoryId);
-    if (!repository || !sha) throw new Error("The reviewed run is missing repository commit information");
-    return {
+    if (!repository) throw new Error("The reviewed run is missing repository information");
+    // Repositories without task changes remain at their specified base snapshot.
+    // They are assessed with the task but require no branch or integration.
+    if (!sha) {
+      if (runRepository.baseCommit !== (runRepository.integrationBaseCommit ?? runRepository.baseCommit)) {
+        throw new Error("The reviewed run is missing carried-forward repository commits");
+      }
+      if (getRepositoryHead(repository.relativePath, workspaceRoot) !== runRepository.baseCommit) {
+        throw new Error(`${repository.name} changed after this task started. Re-run the task before approving integration.`);
+      }
+      return [];
+    }
+    const sourcePath = resolveRepositoryPath(workspaceRoot, repository.relativePath);
+    const targetBranch = inspectRepository(sourcePath, workspaceRoot).defaultBranch;
+    if (!targetBranch) throw new Error(`${repository.name} must have a target branch checked out before approval`);
+    const baseCommit = runRepository.integrationBaseCommit ?? runRepository.baseCommit;
+    const currentHead = getRepositoryHead(repository.relativePath, workspaceRoot);
+    if (currentHead !== baseCommit && currentHead !== sha) {
+      throw new Error(`${repository.name} changed after this task started. Re-run the task before approving integration.`);
+    }
+    return [{
       repositoryId: repository.id,
       name: repository.name,
-      sourcePath: resolveRepositoryPath(workspaceRoot, repository.relativePath),
+      sourcePath,
       branch: `agent/${run.taskId!.slice(0, 8)}-${run.id.slice(0, 8)}`,
       sha,
-      baseCommit: runRepository.integrationBaseCommit ?? runRepository.baseCommit,
-    };
+      baseCommit,
+      targetBranch,
+    }];
   });
 }
 
@@ -2736,8 +2895,8 @@ function resolveTaskExecutionProfile(database: TeamDatabase, projectId: string, 
   const backend = database.getModelBackend(projectId, backendId);
   if (!harness || !backend || !harness.enabled || !backend.enabled) throw new Error(`The ${agentRole.replaceAll("_", " ")} runtime is missing or disabled`);
   if (!harness.supportedProtocols.includes(backend.protocol)) throw new Error(`${harness.name} does not support the ${backend.protocol} model protocol`);
-  if (harness.adapter !== "codex" || !harness.capabilities.includes("coding") || backend.provider !== "openai" || backend.protocol !== "openai-responses") throw new Error(`${agentRole.replaceAll("_", " ")} execution currently requires a Codex coding harness and OpenAI Responses model`);
-  const credentialRef = backend.authMode === "chatgpt" ? "CODEX_ACCESS_TOKEN" : backend.credentialRef;
+  if (harness.adapter !== "codex" || !harness.capabilities.includes("coding") || !["openai", "aws-bedrock"].includes(backend.provider) || backend.protocol !== "openai-responses") throw new Error(`${agentRole.replaceAll("_", " ")} execution currently requires a Codex coding harness and Responses-compatible model`);
+  const credentialRef = backend.authMode === "chatgpt" ? "CODEX_ACCESS_TOKEN" : backend.authMode === "aws-profile" ? "AWS_PROFILE" : backend.credentialRef;
   if (!credentialRef) throw new Error(`The ${agentRole.replaceAll("_", " ")} model does not have an authentication method`);
   const record = {
     id: selection === "primary" ? `runtime-${projectId}-${agentRole}` : `runtime-fallback-${projectId}-${agentRole}`,
@@ -2748,7 +2907,7 @@ function resolveTaskExecutionProfile(database: TeamDatabase, projectId: string, 
     modelClass: "coding",
     credentialRef,
     ...(backend.model ? { model: backend.model } : {}),
-    configuration: { source: "agent_runtime_assignment", selection, codingHarnessId: harness.id, modelBackendId: backend.id, authMode: backend.authMode, protocol: backend.protocol, ...(backend.baseUrl ? { baseUrl: backend.baseUrl } : {}) },
+    configuration: { source: "agent_runtime_assignment", selection, codingHarnessId: harness.id, modelBackendId: backend.id, authMode: backend.authMode, protocol: backend.protocol, ...backend.configuration, ...(backend.baseUrl ? { baseUrl: backend.baseUrl } : {}) },
   };
   return database.getBrainProfile(record.id) ? database.updateBrainProfile(record) : database.createBrainProfile(record);
 }
@@ -2761,6 +2920,7 @@ function runtimeProfileRef(profile: ReturnType<typeof resolveTaskExecutionProfil
     credentialRef: profile.credentialRef,
     ...(profile.model ? { model: profile.model } : {}),
     ...(profile.reasoningLevel ? { reasoningLevel: profile.reasoningLevel } : {}),
+    configuration: profile.configuration,
   };
 }
 
@@ -2775,7 +2935,8 @@ function sameRuntime(left: CodingRunRequest["run"]["brainProfile"], right: Codin
   return left.provider === right.provider
     && left.harness === right.harness
     && left.credentialRef === right.credentialRef
-    && left.model === right.model;
+    && left.model === right.model
+    && JSON.stringify(left.configuration ?? {}) === JSON.stringify(right.configuration ?? {});
 }
 
 function resolveFallbackProfileRef(database: TeamDatabase, projectId: string, agentRole: AgentRole, modelClass: "planning" | "coding") {
@@ -2929,12 +3090,14 @@ async function runTaskVerificationPipeline(
   let repairCount = 0;
   while (true) {
     const baselineRunId = baselineRequest.run.runId;
-    const previouslyPassedChecks = repairCount === 0
-      ? new Set(state.runs.filter((candidate) =>
-        candidate.taskId === taskId && candidate.spec.runPurpose === "verification" && candidate.status === "completed" && candidate.result?.status === "completed" && candidate.spec.upstreamArtifacts.includes(`implementation-run:${baselineRunId}`)
-      ).map((candidate) => candidate.spec.verificationCheck).filter((check): check is VerificationCheck => Boolean(check)))
-      : new Set<VerificationCheck>();
-    const commitByRepository = new Map(baselineResponse.branches.map((branch) => [branch.repositoryId, branch.sha]));
+    const taskRuns = database.getTaskWorkflowContext(task.projectId, taskId).runs;
+    const previouslyPassedChecks = new Set(checks.filter(check => {
+      if (repairCount !== 0) return false;
+      const latest = taskRuns.find(candidate => candidate.spec.runPurpose === "verification" &&
+        candidate.spec.verificationCheck === check && candidate.spec.upstreamArtifacts.includes(`implementation-run:${baselineRunId}`));
+      return latest?.status === "completed" && latest.result?.status === "completed";
+    }));
+    const commitByRepository = new Map(baselineResponse.result.commits.map((commit) => [commit.repositoryId, commit.sha]));
     const round = baselineRequest.run.verificationRound ?? repairCount;
     const failed: Array<{ check: VerificationCheck; summary: string }> = [];
     for (const check of checks) {
@@ -2950,7 +3113,8 @@ async function runTaskVerificationPipeline(
         verificationCheck: check,
         verificationRound: round,
         agentInstructions: state.agentConfigurations.find((configuration) => configuration.agentRole === role)?.rolePrompt ?? "",
-        brainProfile: { provider: profile.provider, harness: profile.harness, modelClass: profile.modelClass, credentialRef: profile.credentialRef, ...(profile.model ? { model: profile.model } : {}), ...(profile.reasoningLevel ? { reasoningLevel: profile.reasoningLevel } : {}) },
+      standingDirectives: database.getAgentStandingDirectives(state.project.id, role),
+        brainProfile: runtimeProfileRef(profile),
         repositories: baselineRequest.run.repositories.map((repository) => ({ ...repository, baseCommit: commitByRepository.get(repository.repositoryId) ?? repository.baseCommit, integrationBaseCommit: repository.integrationBaseCommit ?? repository.baseCommit })),
         taskDescription: `${task.title}\n\nPerform the required ${check.replaceAll("_", " ")} gate against the implementation at ${baselineRunId}. Do not modify source files. Report blocking findings precisely.\n\n${task.description}`,
         acceptanceCriteria: check === "qa"
@@ -2977,7 +3141,8 @@ async function runTaskVerificationPipeline(
       runPurpose: "repair" as const,
       verificationRound: round + 1,
       agentInstructions: state.agentConfigurations.find((configuration) => configuration.agentRole === task.assignedRole)?.rolePrompt ?? "",
-      brainProfile: { provider: profile.provider, harness: profile.harness, modelClass: profile.modelClass, credentialRef: profile.credentialRef, ...(profile.model ? { model: profile.model } : {}), ...(profile.reasoningLevel ? { reasoningLevel: profile.reasoningLevel } : {}) },
+      standingDirectives: database.getAgentStandingDirectives(state.project.id, task.assignedRole),
+      brainProfile: runtimeProfileRef(profile),
       repositories: baselineRequest.run.repositories.map((repository) => ({ ...repository, baseCommit: commitByRepository.get(repository.repositoryId) ?? repository.baseCommit, integrationBaseCommit: repository.integrationBaseCommit ?? repository.baseCommit })),
       taskDescription: `${task.title}\n\nRepair the implementation to resolve these blocking verification findings:\n${failed.map((finding) => `- ${finding.check.replaceAll("_", " ")}: ${finding.summary}`).join("\n")}`,
       acceptanceCriteria: task.acceptanceCriteria,
@@ -3001,17 +3166,19 @@ async function createReleaseManagerProposal(
   const state = database.getOrchestrationState(projectId);
   const task = state?.tasks.find((candidate) => candidate.id === taskId);
   if (!state || !task) return { passed: false, summary: "Task state was unavailable for release assessment." };
-  const existing = state.integrationProposals.find((proposal) => proposal.taskId === taskId && ["pending", "approved", "applied"].includes(proposal.status));
-  if (existing) return { passed: true, summary: existing.status === "applied" ? "Integration was already applied." : "The integration proposal is already awaiting the Director." };
-  const changeRun = database.listAgentRunsForTask(projectId, taskId).find((candidate) =>
-    candidate.status === "completed" && candidate.result?.status === "completed" && candidate.result.commits.length > 0
-      && ["implementation", "repair"].includes(candidate.spec.runPurpose ?? "implementation")
-  );
-  if (!changeRun?.result) return { passed: false, summary: "No verified implementation commit was available for release assessment." };
+  const { runs } = database.getTaskWorkflowContext(projectId, taskId);
+  const changeRun = runs.find(candidate => ["implementation", "repair"].includes(candidate.spec.runPurpose ?? "implementation"));
+  if (changeRun?.status !== "completed" || changeRun.result?.status !== "completed" || !changeRun.result.commits.length) {
+    return { passed: false, summary: "No current verified implementation commit was available for release assessment." };
+  }
+  const latestRelease = runs.find(run => run.spec.runPurpose === "release" && run.spec.upstreamArtifacts.includes(`implementation-run:${changeRun.id}`));
+  const existing = state.integrationProposals.find(proposal => proposal.taskId === taskId && proposal.changeRunId === changeRun.id &&
+    proposal.releaseRunId === latestRelease?.id && ["pending", "approved", "applied"].includes(proposal.status));
+  if (existing) return { passed: true, summary: existing.status === "applied" ? "Integration was already applied." : "The current integration proposal is already awaiting the Director." };
 
   const profile = resolveTaskExecutionProfile(database, projectId, "release_manager");
   const commitByRepository = new Map(changeRun.result.commits.map((commit) => [commit.repositoryId, commit.sha]));
-  const verificationRuns = database.listAgentRunsForTask(projectId, taskId).filter((candidate) =>
+  const verificationRuns = runs.filter((candidate) =>
     candidate.spec.runPurpose === "verification" && candidate.status === "completed" && candidate.result?.status === "completed"
       && candidate.spec.upstreamArtifacts.includes(`implementation-run:${changeRun.id}`)
   );
@@ -3026,8 +3193,9 @@ async function createReleaseManagerProposal(
     agentRole: "release_manager" as const,
     runPurpose: "release" as const,
     agentInstructions: state.agentConfigurations.find((configuration) => configuration.agentRole === "release_manager")?.rolePrompt ?? "",
+      standingDirectives: database.getAgentStandingDirectives(state.project.id, "release_manager"),
     ...(directorGuidance ? { directorGuidance } : {}),
-    brainProfile: { provider: profile.provider, harness: profile.harness, modelClass: profile.modelClass, credentialRef: profile.credentialRef, ...(profile.model ? { model: profile.model } : {}), ...(profile.reasoningLevel ? { reasoningLevel: profile.reasoningLevel } : {}) },
+    brainProfile: runtimeProfileRef(profile),
     repositories: changeRun.spec.repositories.map((repository) => ({
       ...repository,
       baseCommit: commitByRepository.get(repository.repositoryId) ?? repository.baseCommit,
@@ -3206,6 +3374,13 @@ async function executeAgentTask(
     if (response.result.status === "completed" && run.taskId) {
       const reportOnly = response.branches.length === 0 && reportOnlyTaskRoles.has(run.agentRole);
       if (reportOnly) {
+        const verification = await runTaskVerificationPipeline(database, executor, execution.request, response);
+        if (!verification.passed) {
+          database.createAgentMessage({ id: randomUUID(), projectId: run.projectId, agentRole: run.agentRole, author: "system",
+            body: `The report remains in progress because required checks did not pass:\n\n${verification.summary}` });
+          appendNextRunEvent(database, run.runId, attemptId, "run.failed", verification.summary);
+          return;
+        }
         database.updateTaskStatus(run.projectId, run.taskId, "review");
         database.updateTaskStatus(run.projectId, run.taskId, "completed");
         database.createAgentMessage({
@@ -3285,7 +3460,10 @@ async function executeAgentTask(
       artifacts: [],
     };
     try {
-      database.completeAgentRun(run.runId, attemptId, result);
+      const attempt = database.listRunAttempts(run.runId).find(candidate => candidate.id === attemptId);
+      if (attempt && ["provisioning", "running"].includes(attempt.status)) {
+        database.completeAgentRun(run.runId, attemptId, result);
+      }
       database.createAgentMessage({
         id: randomUUID(),
         projectId: run.projectId,

@@ -76,6 +76,7 @@ export interface UpdateProjectSettingsInput {
 
 export const modelBackendProviders = [
   "openai",
+  "aws-bedrock",
   "anthropic",
   "runpod",
   "openrouter",
@@ -90,11 +91,19 @@ export const modelBackendProtocols = [
   "ollama",
 ] as const;
 
-export const modelBackendAuthModes = ["chatgpt", "api-key", "none"] as const;
+export const modelBackendAuthModes = ["chatgpt", "aws-profile", "api-key", "none"] as const;
 
 export type ModelBackendProvider = (typeof modelBackendProviders)[number];
 export type ModelBackendProtocol = (typeof modelBackendProtocols)[number];
 export type ModelBackendAuthMode = (typeof modelBackendAuthModes)[number];
+
+export type BedrockEndpoint = "runtime" | "mantle";
+
+export interface ModelBackendConfiguration {
+  awsProfile?: string;
+  awsRegion?: string;
+  bedrockEndpoint?: BedrockEndpoint;
+}
 
 export interface ModelBackendSummary {
   id: string;
@@ -106,6 +115,7 @@ export interface ModelBackendSummary {
   baseUrl: string | null;
   authMode: ModelBackendAuthMode;
   credentialRef: string | null;
+  configuration: ModelBackendConfiguration;
   enabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -119,7 +129,27 @@ export interface SaveModelBackendInput {
   baseUrl?: string;
   authMode: ModelBackendAuthMode;
   credentialRef?: string;
+  configuration?: ModelBackendConfiguration;
   enabled?: boolean;
+}
+
+export type ModelBackendPreflightState = "ready" | "not-configured" | "failed" | "unsupported";
+
+export interface ModelBackendPreflightSummary {
+  backendId: string;
+  state: ModelBackendPreflightState;
+  message: string;
+}
+
+export interface DiscoveredModelSummary {
+  id: string;
+  name: string;
+  source: "foundation-model" | "inference-profile";
+}
+
+export interface ModelBackendModelsResponse {
+  backendId: string;
+  models: DiscoveredModelSummary[];
 }
 
 export const codingHarnessAdapters = [
@@ -261,6 +291,7 @@ export const agentRoles = [
 ] as const;
 
 export type AgentRole = (typeof agentRoles)[number];
+export const reportOnlyTaskAgentRoles = ["qa_engineer", "code_reviewer", "security_reviewer"] as const satisfies readonly AgentRole[];
 
 export const defaultAgentRolePrompts: Record<AgentRole, string> = {
   project_manager: "Turn the Engineering Director's broad goals into the smallest coherent set of executable tickets. Treat Project and Repository Context as durable shared knowledge: use it when planning and propose an approval-gated update when the plan establishes lasting information that is missing or outdated. Before finalizing non-trivial plans, seek focused input from the configured planning collaborators: ask the Architect about boundaries, interfaces, data flow, and cross-repository impact, and ask the Tech Lead about feasibility, sequencing, dependencies, and verification. Use their advice as input rather than authority, reconcile conflicts, and retain ownership of the final plan. Assign each ticket to the appropriate agent and repository, state measurable acceptance criteria and required QA, code-review, and security checks, and make dependencies and delivery order explicit. Clarify ambiguity only when it materially changes the plan, honor standing directives, avoid inventing scope or ceremony, and do not perform implementation work yourself.",
@@ -296,7 +327,7 @@ export type TaskStatus =
   | "review"
   | "completed"
   | "cancelled";
-export type ApprovalStatus = "pending" | "approved" | "rejected";
+export type ApprovalStatus = "pending" | "approved" | "rejected" | "superseded";
 export type ApprovalType = "plan" | "integration" | "release" | "high_risk";
 
 export interface ObjectiveSummary {
@@ -340,6 +371,7 @@ export interface ApprovalSummary {
   title: string;
   details: string;
   status: ApprovalStatus;
+  supersededAt: string | null;
   requestedByRole: AgentRole;
   requestedAt: string;
   decidedAt: string | null;
@@ -397,7 +429,12 @@ export interface OrchestrationState {
   messages: AgentMessageSummary[];
   directives: AgentDirectiveSummary[];
   agentConfigurations: AgentConfigurationSummary[];
+  // Recent project history is for display only; active work has no page limit.
   runs: AgentRunSummary[];
+  activeRuns: AgentRunSummary[];
+  // Latest run, implementation, and specialist checks needed by each task card.
+  // Full task history is available through the task workflow endpoint.
+  taskRuns: Record<string, AgentRunSummary[]>;
   runActivities: Record<string, RunEvent>;
   recoveries: TaskWorkflowRecoverySummary[];
   integrationProposals: IntegrationProposalSummary[];
@@ -426,7 +463,7 @@ export interface TaskReviewSummary {
   message: string;
 }
 
-export type IntegrationProposalStatus = "pending" | "approved" | "rejected" | "applied";
+export type IntegrationProposalStatus = "pending" | "approved" | "rejected" | "applied" | "superseded";
 
 export interface IntegrationProposalSummary {
   approvalId: string;
@@ -435,9 +472,15 @@ export interface IntegrationProposalSummary {
   changeRunId: string;
   releaseRunId: string;
   status: IntegrationProposalStatus;
+  supersededAt: string | null;
   createdAt: string;
   decidedAt: string | null;
   appliedAt: string | null;
+  application: {
+    status: "applying" | "retryable" | "applied";
+    leaseExpiresAt: string | null;
+    lastError: string | null;
+  } | null;
 }
 
 export interface TaskWorkflowRunDetail {
@@ -503,6 +546,21 @@ export interface UpdateAgentConfigurationInput {
 export interface CreateAgentMessageInput {
   body: string;
 }
+
+export interface AgentQuestionInput {
+  requestId: string;
+  body: string;
+  source: "voice" | "text";
+}
+
+export interface AgentQuestionResponse {
+  message: AgentMessageSummary;
+  run: AgentRunSummary;
+  duplicate: boolean;
+}
+
+export { routeVoiceQuestion, routeVoiceRequest, voiceRoleLabels } from "./voice.js";
+export type { VoiceQuestionRoute, VoiceRequestRoute, VoiceRecipient, VoiceCommandAction, VoiceCommandInput, VoiceCommandPreview, VoiceCommandReceipt } from "./voice.js";
 
 export interface CreatePlanInput {
   objective: {
@@ -582,6 +640,7 @@ export interface BrainProfileRef {
   credentialRef: string;
   model?: string;
   reasoningLevel?: string;
+  configuration?: Record<string, unknown>;
 }
 
 export interface RunRepositorySpec {
@@ -591,8 +650,10 @@ export interface RunRepositorySpec {
   integrationBaseCommit?: string;
 }
 
-export type RunPurpose = "planning" | "consultation" | "implementation" | "repair" | "verification" | "release";
-export type VerificationCheck = "qa" | "code_review" | "security";
+export const runPurposes = ["planning", "consultation", "implementation", "repair", "verification", "release"] as const;
+export type RunPurpose = typeof runPurposes[number];
+export const verificationChecks = ["qa", "code_review", "security"] as const;
+export type VerificationCheck = typeof verificationChecks[number];
 
 export interface RunSpec {
   schemaVersion: typeof runContractSchemaVersion;
@@ -605,6 +666,7 @@ export interface RunSpec {
   verificationRound?: number;
   agentInstructions?: string;
   directorGuidance?: string;
+  standingDirectives?: string[];
   brainProfile: BrainProfileRef;
   repositories: RunRepositorySpec[];
   objective: string;
@@ -653,6 +715,9 @@ export interface RunResult {
   status: RunResultStatus;
   summary: string;
   changedFiles: string[];
+  // Published task changes relative to each repository's original integration
+  // base, including changes carried through repairs. Omitted repositories keep
+  // their RunSpec base snapshot (which may be unborn). Assessments publish none.
   commits: Array<{ repositoryId: string; sha: string }>;
   checks: RunCheckResult[];
   acceptanceCriteria: RunAcceptanceResult[];
@@ -705,6 +770,7 @@ export interface AgentConsultationResult extends AgentConsultationRequest {
 }
 
 export interface PlanningRunRequest {
+  planningOnly?: boolean;
   run: RunSpec;
   directorMessageId: string;
   directives: AgentDirectiveSummary[];
@@ -725,6 +791,8 @@ export interface ConsultationRunRequest {
   run: RunSpec;
   requestingRole: AgentRole | "engineering_director";
   question: string;
+  questionOnly?: boolean;
+  activityContext?: string;
   directives: AgentDirectiveSummary[];
   conversation: Array<Pick<AgentMessageSummary, "author" | "body">>;
   projectContext: string;
@@ -774,6 +842,7 @@ export interface CodingRunResponse {
 }
 
 export interface ApplyCodingRunRequest {
+  approvalId: string;
   runId: string;
   taskId: string;
   repositories: Array<{
@@ -783,6 +852,7 @@ export interface ApplyCodingRunRequest {
     branch: string;
     sha: string;
     baseCommit: string;
+    targetBranch: string;
   }>;
 }
 

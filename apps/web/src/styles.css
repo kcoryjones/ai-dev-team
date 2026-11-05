@@ -489,3 +489,28 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 @media (max-width: 980px) { .settings-grid, .model-backend-layout { grid-template-columns: 1fr; } .settings-card-wide { grid-column: auto; } .brain-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); } .harness-chip-grid.capabilities { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 700px) { .app-shell { grid-template-columns: 1fr; } .sidebar { position: static; height: auto; } .sidebar-repositories { overflow: visible; } .sidebar-foot { display: none; } .main-stage { padding: 22px 14px 40px; } .stage-header { align-items: flex-start; flex-direction: column; } .header-metrics { flex-wrap: wrap; } .settings-intro, .brain-heading { align-items: flex-start; flex-direction: column; gap: 10px; } .settings-card { padding: 18px; } .setup-field-grid, .settings-repository-columns, .brain-fields { grid-template-columns: 1fr; } .brain-base-url { grid-column: auto; } .setup-create-repository { align-items: stretch; grid-template-columns: 1fr; } .settings-card-actions { align-items: stretch; flex-direction: column-reverse; } .settings-card-actions button { width: 100%; } .model-backend-editor .settings-card-actions > div { display: grid; } .harness-chip-grid, .harness-chip-grid.capabilities { grid-template-columns: repeat(2, minmax(0, 1fr)); } .runtime-pairing { grid-template-columns: 1fr; } .runtime-pairing > span { min-height: auto; transform: rotate(90deg); } .agent-row.agents-2, .agent-row.agents-3 { grid-template-columns: 1fr; } .agent-chat-popover { max-height: calc(100vh - 40px); } .plan-popover[open] > form { position: fixed; inset: 10px; width: auto; max-height: calc(100vh - 20px); } .approval-item { grid-template-columns: 1fr 1fr; } .approval-item > div, .approval-item textarea { grid-column: 1 / -1; } .task-detail-backdrop { padding: 8px; } .task-workflow-panel { max-height: calc(100vh - 16px); } .task-detail-header { padding: 16px; } .task-detail-header-actions { align-items: flex-end; flex-direction: column-reverse; } .task-detail-body { max-height: calc(100vh - 120px); padding: 14px; } .task-recovery-banner, .task-integration-proposal, .task-detail-summary, .workflow-run-columns { grid-template-columns: 1fr; } .task-detail-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .workflow-run > summary { grid-template-columns: 20px 8px minmax(0, 1fr); } .workflow-run-state { grid-column: 3; justify-items: start; } .workflow-run-body { margin-left: 22px; } }
 @media (max-width: 700px) { .repository-details { grid-template-columns: 1fr; } .repository-details .repository-detail-wide { grid-column: auto; } }
+/* Local microphone and transcript preview. */
+.voice-panel { margin: 0 0 20px; padding: 14px 18px; border: 1px solid #263c46; border-radius: 12px; background: #0d1b22; color: #b9cbd3; }
+.voice-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.voice-controls strong { flex: 1; font-size: 13px; }
+.voice-controls button, .voice-transcript button { padding: 6px 10px; font-size: 12px; border: 1px solid #426b62; border-radius: 6px; background: #10231f; color: #9dd8cb; cursor: pointer; }
+.voice-panel > p { margin: 8px 0 0; font-size: 12px; line-height: 1.5; }
+.voice-indicator { width: 9px; height: 9px; border-radius: 50%; background: #94a3b8; }
+.voice-armed { background: #16a34a; }
+.voice-capturing { background: #dc2626; }
+.voice-loading, .voice-transcribing { background: #d97706; }
+.voice-panel .voice-error { color: #f0a59d; }
+.voice-transcript { border-top: 1px solid #263c46; margin-top: 12px; padding-top: 12px; }
+.voice-transcript > span { font-size: 11px; font-weight: 600; }
+.voice-transcript p { margin: 6px 0 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.voice-transcript form { display: grid; gap: 10px; margin: 10px 0; }
+.voice-transcript label { display: grid; gap: 5px; font-size: 12px; }
+.voice-transcript select, .voice-transcript textarea, .chat-intent { color: #d6e7e5; background: #10231f; border: 1px solid #426b62; border-radius: 6px; padding: 8px; }
+.voice-transcript textarea { min-height: 70px; resize: vertical; }
+.voice-transcript button { margin: 0 8px 6px 0; }
+.voice-answer { border-left: 2px solid #72cbb3; padding-left: 12px; margin: 12px 0; }
+.voice-answer > span { font-size: 11px; font-weight: 600; }
+.chat-intent { width: 100%; font-size: 12px; margin-bottom: 8px; }
+
+.voice-action-review { padding: 12px; margin: 12px 0; border: 1px solid #426b62; border-radius: 8px; background: #10231f; }
+.voice-action-review blockquote { margin: 10px 0; padding-left: 12px; border-left: 2px solid #72cbb3; white-space: pre-wrap; overflow-wrap: anywhere; }

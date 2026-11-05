@@ -11,9 +11,13 @@
     "test": "npm run build && node --test dist/*.test.js"
   },
   "dependencies": {
+    "@aws-sdk/client-bedrock": "^3.1154.0",
+    "@aws-sdk/credential-providers": "^3.1154.0",
     "@engineering-team/contracts": "*",
     "@engineering-team/database": "*",
     "@hono/node-server": "^1.13.8",
+    "@smithy/core": "^3.36.1",
+    "@smithy/signature-v4": "^5.7.4",
     "hono": "^4.6.17",
     "zod": "^3.24.1"
   },

@@ -1,4 +1,6 @@
 import { Fragment, type Dispatch, type FormEvent, type MouseEvent, type SetStateAction, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { VoicePanel } from "./voice/VoicePanel";
+import { submitQuestion, type QuestionDraft } from "./voice/questions";
 import {
   agentRoles,
   type AgentRuntimeAssignmentSummary,
@@ -12,11 +14,14 @@ import {
   type ContextRevisionSummary,
   type CreatePlanResponse,
   type DiscoveredRepository,
+  type DiscoveredModelSummary,
   type OrchestrationState,
   type ModelBackendAuthMode,
   type ModelBackendProtocol,
   type ModelBackendProvider,
   type ModelBackendSummary,
+  type ModelBackendPreflightSummary,
+  type ModelBackendModelsResponse,
   type SaveModelBackendInput,
   type SaveCodingHarnessInput,
   type HarnessCapability,
@@ -44,6 +49,10 @@ interface ProjectSettingsResponse {
 
 interface ModelBackendsResponse {
   backends: ModelBackendSummary[];
+}
+
+interface ModelBackendPreflightResponse {
+  preflight: ModelBackendPreflightSummary;
 }
 
 interface CodingHarnessesResponse {
@@ -206,6 +215,7 @@ export function App() {
   const [draftTasks, setDraftTasks] = useState<DraftTask[]>([newDraftTask(1)]);
   const [decisionNotes, setDecisionNotes] = useState<Record<string, string>>({});
   const [chatDraft, setChatDraft] = useState("");
+  const pendingTextQuestion = useRef<(QuestionDraft & { projectId: string }) | null>(null);
 
   const selectedProject = useMemo(
     () => projects.find((project) => project.id === selectedProjectId) ?? null,
@@ -426,11 +436,13 @@ export function App() {
   useEffect(() => { void loadCodingHarnessStatuses(selectedProjectId); }, [loadCodingHarnessStatuses, selectedProjectId]);
   useEffect(() => { void loadAgentRuntimeAssignments(selectedProjectId); }, [loadAgentRuntimeAssignments, selectedProjectId]);
   useEffect(() => {
-    const hasActiveRun = orchestration?.runs.some((run) => ["queued", "provisioning", "running"].includes(run.status)) ?? false;
-    if (!selectedProjectId || !hasActiveRun) return;
+    const hasActiveRun = (orchestration?.activeRuns.length ?? 0) > 0;
+    const hasApplyingIntegration = orchestration?.integrationProposals.some((proposal) =>
+      proposal.application?.status === "applying" && Date.parse(proposal.application.leaseExpiresAt ?? "") > Date.now()) ?? false;
+    if (!selectedProjectId || (!hasActiveRun && !hasApplyingIntegration)) return;
     const timer = window.setInterval(() => { void loadOrchestration(selectedProjectId); }, 2_000);
     return () => window.clearInterval(timer);
-  }, [loadOrchestration, orchestration?.runs, selectedProjectId]);
+  }, [loadOrchestration, orchestration?.activeRuns, orchestration?.integrationProposals, selectedProjectId]);
 
   async function attachRepository(repository: DiscoveredRepository): Promise<boolean> {
     if (!selectedProjectId) return false;
@@ -635,6 +647,22 @@ export function App() {
     }
   }
 
+  async function preflightModelBackend(backendId: string): Promise<ModelBackendPreflightSummary> {
+    if (!selectedProjectId) throw new Error("Select a Project first");
+    const response = await fetch(`/api/projects/${selectedProjectId}/model-backends/${backendId}/preflight`, { method: "POST" });
+    const body = await readResponse<ModelBackendPreflightResponse | ApiError>(response);
+    if (!response.ok) throw new Error("message" in body ? body.message : "Unable to test model backend");
+    return (body as ModelBackendPreflightResponse).preflight;
+  }
+
+  async function discoverModelBackendModels(backendId: string): Promise<DiscoveredModelSummary[]> {
+    if (!selectedProjectId) throw new Error("Select a Project first");
+    const response = await fetch(`/api/projects/${selectedProjectId}/model-backends/${backendId}/models`, { method: "POST" });
+    const body = await readResponse<ModelBackendModelsResponse | ApiError>(response);
+    if (!response.ok) throw new Error("message" in body ? body.message : "Unable to discover models");
+    return (body as ModelBackendModelsResponse).models;
+  }
+
   async function saveCodingHarness(input: SaveCodingHarnessInput, harnessId?: string): Promise<boolean> {
     if (!selectedProjectId) return false;
     setSubmitting(true);
@@ -779,6 +807,7 @@ export function App() {
   async function decideApproval(approvalId: string, decision: "approved" | "rejected") {
     if (!selectedProjectId) return;
     setSubmitting(true);
+    setError(null);
     try {
       const response = await fetch(`/api/projects/${selectedProjectId}/approvals/${approvalId}`, {
         method: "PATCH",
@@ -786,9 +815,10 @@ export function App() {
         body: JSON.stringify({ decision, note: decisionNotes[approvalId] || undefined }),
       });
       const body = await readResponse<ApiError>(response);
-      if (!response.ok) throw new Error(body.message || "Unable to record decision");
       await loadOrchestration(selectedProjectId);
+      if (!response.ok) throw new Error(body.message || "Unable to record decision");
     } catch (requestError) {
+      await loadOrchestration(selectedProjectId);
       setError(requestError instanceof Error ? requestError.message : "Unable to record decision");
     } finally {
       setSubmitting(false);
@@ -889,12 +919,25 @@ export function App() {
     }
   }
 
-  async function sendMessage(event: FormEvent<HTMLFormElement>) {
+  async function sendMessage(event: FormEvent<HTMLFormElement>, intent: "message" | "question") {
     event.preventDefault();
     if (!selectedProjectId || !chatDraft.trim()) return;
     setSubmitting(true);
+    setError(null);
     try {
-      const activeTaskRun = orchestration?.runs.find((run) => run.agentRole === selectedRole && run.taskId && ["queued", "provisioning", "running", "waiting"].includes(run.status));
+      if (intent === "question") {
+        const previous = pendingTextQuestion.current;
+        const question = previous?.projectId === selectedProjectId && previous.recipient === selectedRole && previous.body === chatDraft.trim()
+          ? previous
+          : { projectId: selectedProjectId, requestId: crypto.randomUUID(), recipient: selectedRole, body: chatDraft.trim(), source: "text" as const };
+        pendingTextQuestion.current = question;
+        await submitQuestion(selectedProjectId, question);
+        pendingTextQuestion.current = null;
+        setChatDraft("");
+        await loadOrchestration(selectedProjectId);
+        return;
+      }
+      const activeTaskRun = orchestration?.activeRuns.find((run) => run.agentRole === selectedRole && run.taskId);
       const response = await fetch(activeTaskRun?.taskId
         ? `/api/projects/${selectedProjectId}/tasks/${activeTaskRun.taskId}/redirect`
         : `/api/projects/${selectedProjectId}/agents/${selectedRole}/messages`, {
@@ -907,8 +950,8 @@ export function App() {
       setChatDraft("");
       await loadOrchestration(selectedProjectId);
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "Unable to send message");
       await loadOrchestration(selectedProjectId);
+      setError(requestError instanceof Error ? requestError.message : "Unable to send message");
     } finally {
       setSubmitting(false);
     }
@@ -989,6 +1032,10 @@ export function App() {
         </header>
 
         {error && <div className="alert" role="alert">{error}</div>}
+        {selectedProject && <VoicePanel key={selectedProject.id} projectId={selectedProject.id} orchestration={orchestration} onConversationChange={(role, open) => {
+          if (open) showAgentChat(role);
+          void loadOrchestration(selectedProject.id);
+        }} />}
 
         {!selectedProject ? (
           <section className="welcome-state"><div className="empty-orbit">ET</div><h2>{loading ? "Opening project…" : "Unable to initialize project"}</h2><p>The workspace Project contains the sibling repositories used by the team.</p></section>
@@ -1001,7 +1048,7 @@ export function App() {
         ) : view === "repository" && selectedRepository ? (
           <RepositorySettingsView repository={selectedRepository} contextDocument={orchestration?.contexts.find((document) => document.repositoryId === selectedRepository.id) ?? null} revisions={orchestration?.contextRevisions.filter((revision) => revision.repositoryId === selectedRepository.id) ?? []} submitting={submitting} save={updateRepository} saveContext={(content) => saveContext(selectedRepository.id, content)} />
         ) : projectSettings ? (
-          <SettingsView project={selectedProject} settings={projectSettings} contextDocument={orchestration?.contexts.find((document) => document.repositoryId === null) ?? null} revisions={orchestration?.contextRevisions.filter((revision) => revision.repositoryId === null) ?? []} saveContext={(content) => saveContext(null, content)} modelBackends={modelBackends} modelBackendsLoading={modelBackendsLoading} codingHarnesses={codingHarnesses} codingHarnessesLoading={codingHarnessesLoading} codingHarnessStatuses={codingHarnessStatuses} codingHarnessStatusesLoading={codingHarnessStatusesLoading} submitting={submitting} updateProjectSettings={updateProjectSettings} saveModelBackend={saveModelBackend} deleteModelBackend={deleteModelBackend} saveCodingHarness={saveCodingHarness} deleteCodingHarness={deleteCodingHarness} preflightCodingHarness={preflightCodingHarness} />
+          <SettingsView project={selectedProject} settings={projectSettings} contextDocument={orchestration?.contexts.find((document) => document.repositoryId === null) ?? null} revisions={orchestration?.contextRevisions.filter((revision) => revision.repositoryId === null) ?? []} saveContext={(content) => saveContext(null, content)} modelBackends={modelBackends} modelBackendsLoading={modelBackendsLoading} codingHarnesses={codingHarnesses} codingHarnessesLoading={codingHarnessesLoading} codingHarnessStatuses={codingHarnessStatuses} codingHarnessStatusesLoading={codingHarnessStatusesLoading} submitting={submitting} updateProjectSettings={updateProjectSettings} saveModelBackend={saveModelBackend} deleteModelBackend={deleteModelBackend} preflightModelBackend={preflightModelBackend} discoverModelBackendModels={discoverModelBackendModels} saveCodingHarness={saveCodingHarness} deleteCodingHarness={deleteCodingHarness} preflightCodingHarness={preflightCodingHarness} />
         ) : null}
       </main>
     </div>
@@ -1048,7 +1095,7 @@ function RepositorySettingsView({ repository, contextDocument, revisions, submit
   </section>;
 }
 
-function SettingsView({ project, settings, contextDocument, revisions, saveContext, modelBackends, modelBackendsLoading, codingHarnesses, codingHarnessesLoading, codingHarnessStatuses, codingHarnessStatusesLoading, submitting, updateProjectSettings, saveModelBackend, deleteModelBackend, saveCodingHarness, deleteCodingHarness, preflightCodingHarness }: {
+function SettingsView({ project, settings, contextDocument, revisions, saveContext, modelBackends, modelBackendsLoading, codingHarnesses, codingHarnessesLoading, codingHarnessStatuses, codingHarnessStatusesLoading, submitting, updateProjectSettings, saveModelBackend, deleteModelBackend, preflightModelBackend, discoverModelBackendModels, saveCodingHarness, deleteCodingHarness, preflightCodingHarness }: {
   project: ProjectSummary;
   settings: ProjectSettingsSummary;
   contextDocument: ContextDocumentSummary | null;
@@ -1064,6 +1111,8 @@ function SettingsView({ project, settings, contextDocument, revisions, saveConte
   updateProjectSettings: (input: UpdateProjectSettingsInput) => Promise<boolean>;
   saveModelBackend: (input: SaveModelBackendInput, backendId?: string) => Promise<boolean>;
   deleteModelBackend: (backendId: string) => Promise<boolean>;
+  preflightModelBackend: (backendId: string) => Promise<ModelBackendPreflightSummary>;
+  discoverModelBackendModels: (backendId: string) => Promise<DiscoveredModelSummary[]>;
   saveCodingHarness: (input: SaveCodingHarnessInput, harnessId?: string) => Promise<boolean>;
   deleteCodingHarness: (harnessId: string) => Promise<boolean>;
   preflightCodingHarness: (harnessId: string) => Promise<CodingHarnessPreflightSummary>;
@@ -1105,7 +1154,7 @@ function SettingsView({ project, settings, contextDocument, revisions, saveConte
       </form>
 
       <CodingHarnessesCard harnesses={codingHarnesses} statuses={codingHarnessStatuses} loading={codingHarnessesLoading || codingHarnessStatusesLoading} submitting={submitting} save={saveCodingHarness} remove={deleteCodingHarness} preflight={preflightCodingHarness} />
-      <ModelBackendsCard backends={modelBackends} loading={modelBackendsLoading} submitting={submitting} save={saveModelBackend} remove={deleteModelBackend} />
+      <ModelBackendsCard backends={modelBackends} loading={modelBackendsLoading} submitting={submitting} save={saveModelBackend} remove={deleteModelBackend} preflight={preflightModelBackend} discoverModels={discoverModelBackendModels} />
     </div>
   </section>;
 }
@@ -1129,12 +1178,14 @@ function ContextEditor({ title, description, document, revisions, submitting, sa
   </form>;
 }
 
-function ModelBackendsCard({ backends, loading, submitting, save, remove }: {
+function ModelBackendsCard({ backends, loading, submitting, save, remove, preflight, discoverModels }: {
   backends: ModelBackendSummary[];
   loading: boolean;
   submitting: boolean;
   save: (input: SaveModelBackendInput, backendId?: string) => Promise<boolean>;
   remove: (backendId: string) => Promise<boolean>;
+  preflight: (backendId: string) => Promise<ModelBackendPreflightSummary>;
+  discoverModels: (backendId: string) => Promise<DiscoveredModelSummary[]>;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [name, setName] = useState("");
@@ -1144,6 +1195,12 @@ function ModelBackendsCard({ backends, loading, submitting, save, remove }: {
   const [baseUrl, setBaseUrl] = useState("");
   const [authMode, setAuthMode] = useState<ModelBackendAuthMode>("chatgpt");
   const [credentialRef, setCredentialRef] = useState("");
+  const [awsProfile, setAwsProfile] = useState("");
+  const [awsRegion, setAwsRegion] = useState("us-east-2");
+  const [bedrockEndpoint, setBedrockEndpoint] = useState<"runtime" | "mantle">("runtime");
+  const [discoveredModels, setDiscoveredModels] = useState<DiscoveredModelSummary[]>([]);
+  const [preflightResult, setPreflightResult] = useState<ModelBackendPreflightSummary | null>(null);
+  const [inspectionRunning, setInspectionRunning] = useState(false);
   const [enabled, setEnabled] = useState(true);
 
   function resetEditor() {
@@ -1155,6 +1212,11 @@ function ModelBackendsCard({ backends, loading, submitting, save, remove }: {
     setBaseUrl("");
     setAuthMode("chatgpt");
     setCredentialRef("");
+    setAwsProfile("");
+    setAwsRegion("us-east-2");
+    setBedrockEndpoint("runtime");
+    setDiscoveredModels([]);
+    setPreflightResult(null);
     setEnabled(true);
   }
 
@@ -1167,6 +1229,11 @@ function ModelBackendsCard({ backends, loading, submitting, save, remove }: {
     setBaseUrl(backend.baseUrl ?? "");
     setAuthMode(backend.authMode);
     setCredentialRef(backend.credentialRef ?? "");
+    setAwsProfile(backend.configuration.awsProfile ?? "");
+    setAwsRegion(backend.configuration.awsRegion ?? "us-east-2");
+    setBedrockEndpoint(backend.configuration.bedrockEndpoint ?? "runtime");
+    setDiscoveredModels([]);
+    setPreflightResult(null);
     setEnabled(backend.enabled);
   }
 
@@ -1177,6 +1244,8 @@ function ModelBackendsCard({ backends, loading, submitting, save, remove }: {
     setAuthMode(defaults.authMode);
     setCredentialRef(defaults.credentialRef);
     setBaseUrl(defaults.baseUrl);
+    setDiscoveredModels([]);
+    setPreflightResult(null);
   }
 
   function changeAuthMode(nextMode: ModelBackendAuthMode) {
@@ -1197,6 +1266,7 @@ function ModelBackendsCard({ backends, loading, submitting, save, remove }: {
       ...(baseUrl.trim() ? { baseUrl: baseUrl.trim() } : {}),
       authMode,
       ...(authMode === "api-key" && credentialRef.trim() ? { credentialRef: credentialRef.trim() } : {}),
+      ...(provider === "aws-bedrock" ? { configuration: { awsProfile: awsProfile.trim(), awsRegion: awsRegion.trim(), bedrockEndpoint } } : {}),
       enabled,
     }, editingId ?? undefined);
     if (saved) resetEditor();
@@ -1205,6 +1275,20 @@ function ModelBackendsCard({ backends, loading, submitting, save, remove }: {
   async function deleteBackend(backend: ModelBackendSummary) {
     if (!window.confirm(`Delete the model backend “${backend.name}”?`)) return;
     if (await remove(backend.id) && editingId === backend.id) resetEditor();
+  }
+
+  async function inspectBackend(action: "preflight" | "models") {
+    if (!editingId) return;
+    setInspectionRunning(true);
+    setPreflightResult(null);
+    try {
+      if (action === "preflight") setPreflightResult(await preflight(editingId));
+      else setDiscoveredModels(await discoverModels(editingId));
+    } catch (error) {
+      setPreflightResult({ backendId: editingId, state: "failed", message: error instanceof Error ? error.message : "Backend inspection failed" });
+    } finally {
+      setInspectionRunning(false);
+    }
   }
 
   return <section className="settings-card settings-card-wide model-backends-card">
@@ -1222,15 +1306,18 @@ function ModelBackendsCard({ backends, loading, submitting, save, remove }: {
         <div className="setup-section-label"><span>{editingId ? "Edit backend" : "Add backend"}</span>{editingId && <button type="button" onClick={resetEditor}>New instead</button>}</div>
         <div className="brain-fields">
           <label>Display name<input value={name} onChange={(event) => setName(event.target.value)} placeholder="RunPod DeepSeek" maxLength={120} required/></label>
-          <label>Provider<select value={provider} onChange={(event) => changeProvider(event.target.value as ModelBackendProvider)}><option value="openai">OpenAI / ChatGPT</option><option value="anthropic">Anthropic</option><option value="runpod">RunPod</option><option value="openrouter">OpenRouter</option><option value="ollama">Ollama</option><option value="custom">Custom endpoint</option></select></label>
+          <label>Provider<select value={provider} onChange={(event) => changeProvider(event.target.value as ModelBackendProvider)}><option value="openai">OpenAI / ChatGPT</option><option value="aws-bedrock">Amazon Bedrock</option><option value="anthropic">Anthropic</option><option value="runpod">RunPod</option><option value="openrouter">OpenRouter</option><option value="ollama">Ollama</option><option value="custom">Custom endpoint</option></select></label>
           <label>API protocol<select value={protocol} onChange={(event) => setProtocol(event.target.value as ModelBackendProtocol)}><option value="openai-responses">OpenAI Responses</option><option value="openai-chat-completions">OpenAI Chat Completions</option><option value="anthropic-messages">Anthropic Messages</option><option value="ollama">Ollama</option></select></label>
-          <label>Model ID <span>Optional</span><input value={model} onChange={(event) => setModel(event.target.value)} placeholder={provider === "runpod" ? "deepseek-v3" : "Provider default"} maxLength={160}/></label>
-          <label>Authentication<select value={authMode} onChange={(event) => changeAuthMode(event.target.value as ModelBackendAuthMode)}><option value="chatgpt" disabled={provider !== "openai"}>ChatGPT account</option><option value="api-key">API key reference</option><option value="none">No authentication</option></select></label>
+          <label>Model ID <span>Optional</span><input list={provider === "aws-bedrock" ? "bedrock-models" : undefined} value={model} onChange={(event) => setModel(event.target.value)} placeholder={provider === "runpod" ? "deepseek-v3" : provider === "aws-bedrock" ? "Discover after saving" : "Provider default"} maxLength={160}/>{provider === "aws-bedrock" && <datalist id="bedrock-models">{discoveredModels.map((candidate) => <option value={candidate.id} key={candidate.id}>{candidate.name}</option>)}</datalist>}</label>
+          <label>Authentication<select value={authMode} onChange={(event) => changeAuthMode(event.target.value as ModelBackendAuthMode)} disabled={provider === "aws-bedrock"}><option value="chatgpt" disabled={provider !== "openai"}>ChatGPT account</option><option value="aws-profile" disabled={provider !== "aws-bedrock"}>AWS profile</option><option value="api-key">API key reference</option><option value="none">No authentication</option></select></label>
           {authMode === "api-key" && <label>Credential environment variable<input value={credentialRef} onChange={(event) => setCredentialRef(event.target.value.toUpperCase())} placeholder="RUNPOD_API_KEY" pattern="[A-Z][A-Z0-9_]*" required/></label>}
-          <label className="brain-base-url">Endpoint URL <span>{["runpod", "ollama", "custom"].includes(provider) ? "Required" : "Optional override"}</span><input type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={provider === "ollama" ? "http://localhost:11434" : provider === "runpod" ? "https://api.runpod.ai/v2/.../openai/v1" : "Use provider default"} required={["runpod", "ollama", "custom"].includes(provider)}/></label>
+          {provider === "aws-bedrock" && <><label>AWS profile<input value={awsProfile} onChange={(event) => setAwsProfile(event.target.value)} placeholder="codex-bedrock" maxLength={128} required/></label><label>AWS Region<input value={awsRegion} onChange={(event) => setAwsRegion(event.target.value)} placeholder="us-east-2" pattern="[a-z]{2}(-gov)?-[a-z]+-[0-9]" required/></label><label>Bedrock endpoint<select value={bedrockEndpoint} onChange={(event) => setBedrockEndpoint(event.target.value as "runtime" | "mantle")}><option value="runtime">Runtime (recommended)</option><option value="mantle">Mantle</option></select></label></>}
+          {provider !== "aws-bedrock" && <label className="brain-base-url">Endpoint URL <span>{["runpod", "ollama", "custom"].includes(provider) ? "Required" : "Optional override"}</span><input type="url" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={provider === "ollama" ? "http://localhost:11434" : provider === "runpod" ? "https://api.runpod.ai/v2/.../openai/v1" : "Use provider default"} required={["runpod", "ollama", "custom"].includes(provider)}/></label>}
         </div>
         <label className="backend-enabled"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)}/><span><strong>Enabled for runtime profiles</strong><small>Disabled backends remain saved but cannot be selected for new profiles.</small></span></label>
-        <div className="credential-notice"><span>⌁</span><div><strong>Only credential references are stored</strong><p>API key values and ChatGPT session tokens remain outside the Project database.</p></div></div>
+        <div className="credential-notice"><span>⌁</span><div><strong>Only credential references are stored</strong><p>API key values, ChatGPT session tokens, and AWS credentials remain outside the Project database.</p></div></div>
+        {editingId && provider === "aws-bedrock" && <div className="settings-card-actions"><span>{discoveredModels.length ? `${discoveredModels.length} compatible models discovered` : "Save profile changes before testing."}</span><div><button className="text-button" type="button" disabled={inspectionRunning || submitting} onClick={() => void inspectBackend("models")}>{inspectionRunning ? "Checking…" : "Discover models"}</button><button className="text-button" type="button" disabled={inspectionRunning || submitting} onClick={() => void inspectBackend("preflight")}>Test connection</button></div></div>}
+        {preflightResult && <div className={`harness-preflight ${preflightResult.state}`}><strong>{preflightResult.state === "ready" ? "✓ Ready" : "Test failed"}</strong><p>{preflightResult.message}</p></div>}
         <div className="settings-card-actions"><span>{editingId ? "Changes affect future runtime profiles." : "Harness compatibility is configured in the next layer."}</span><div>{editingId && <button className="text-button danger" type="button" disabled={submitting} onClick={() => { const backend = backends.find((candidate) => candidate.id === editingId); if (backend) void deleteBackend(backend); }}>Delete</button>}<button className="primary-button" type="submit" disabled={submitting || loading || !name.trim()}>{editingId ? "Save backend" : "Add backend"}</button></div></div>
       </form>
     </div>
@@ -1244,6 +1331,7 @@ function modelBackendDefaults(provider: ModelBackendProvider): {
   baseUrl: string;
 } {
   if (provider === "anthropic") return { protocol: "anthropic-messages", authMode: "api-key", credentialRef: "ANTHROPIC_API_KEY", baseUrl: "" };
+  if (provider === "aws-bedrock") return { protocol: "openai-responses", authMode: "aws-profile", credentialRef: "", baseUrl: "" };
   if (provider === "runpod") return { protocol: "openai-chat-completions", authMode: "api-key", credentialRef: "RUNPOD_API_KEY", baseUrl: "" };
   if (provider === "openrouter") return { protocol: "openai-chat-completions", authMode: "api-key", credentialRef: "OPENROUTER_API_KEY", baseUrl: "https://openrouter.ai/api/v1" };
   if (provider === "ollama") return { protocol: "ollama", authMode: "none", credentialRef: "", baseUrl: "http://localhost:11434" };
@@ -1253,6 +1341,7 @@ function modelBackendDefaults(provider: ModelBackendProvider): {
 
 function modelBackendProviderLabel(provider: ModelBackendProvider): string {
   if (provider === "openai") return "OpenAI / ChatGPT";
+  if (provider === "aws-bedrock") return "Amazon Bedrock";
   if (provider === "openrouter") return "OpenRouter";
   return provider.charAt(0).toUpperCase() + provider.slice(1);
 }
@@ -1443,7 +1532,7 @@ function LiveView({ orchestration, runtimeAssignments, codingHarnesses, modelBac
   cancelAgentRun: (agentRole: AgentRole, runId: string) => Promise<void>;
   chatDraft: string;
   setChatDraft: (value: string) => void;
-  sendMessage: (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  sendMessage: (event: FormEvent<HTMLFormElement>, intent: "message" | "question") => Promise<void>;
   removeDirective: (agentRole: AgentRole, directiveId: string) => Promise<void>;
   updateRolePrompt: (agentRole: AgentRole, rolePrompt: string, consultationRoles: AgentRole[]) => Promise<boolean>;
   submitting: boolean;
@@ -1453,12 +1542,15 @@ function LiveView({ orchestration, runtimeAssignments, codingHarnesses, modelBac
   const [agentPanel, setAgentPanel] = useState<"role" | "directives" | "memory" | "chat">("chat");
   const [rolePromptDraft, setRolePromptDraft] = useState("");
   const [consultationRolesDraft, setConsultationRolesDraft] = useState<AgentRole[]>([]);
+  const [chatIntent, setChatIntent] = useState<"message" | "question">("message");
   const chatPanelRef = useRef<HTMLElement | null>(null);
   const messages = orchestration?.messages.filter((message) => message.agentRole === selectedRole) ?? [];
   const directives = orchestration?.directives.filter((directive) => directive.agentRole === selectedRole) ?? [];
   const agentConfiguration = orchestration?.agentConfigurations.find((configuration) => configuration.agentRole === selectedRole);
-  const activeRun = orchestration?.runs.find((run) => run.agentRole === selectedRole && ["queued", "provisioning", "running", "waiting"].includes(run.status));
-  const activeTaskRun = activeRun?.taskId ? activeRun : undefined;
+  const roleRuns = orchestration?.activeRuns.filter((run) => run.agentRole === selectedRole) ?? [];
+  const activeTaskRun = roleRuns.find((run) => run.taskId);
+  const activeRun = activeTaskRun ?? roleRuns.find(run => !run.spec.upstreamArtifacts.some(artifact => artifact.startsWith("director-question:"))) ?? roleRuns[0];
+  const activeQuestionRun = roleRuns.find((run) => run.spec.upstreamArtifacts.some(artifact => artifact.startsWith("director-question:")));
   const assignmentByRole = new Map(runtimeAssignments.map((assignment) => [assignment.agentRole, assignment]));
   const selectedAssignment = assignmentByRole.get(selectedRole);
   const selectedHarness = codingHarnesses.find((candidate) => candidate.id === selectedAssignment?.codingHarnessId);
@@ -1468,10 +1560,12 @@ function LiveView({ orchestration, runtimeAssignments, codingHarnesses, modelBac
     && selectedHarness.adapter === "codex"
     && selectedHarness.capabilities.includes("planning")
     && selectedBackend?.enabled
-    && selectedBackend.provider === "openai"
+    && ["openai", "aws-bedrock"].includes(selectedBackend.provider)
     && selectedBackend.protocol === "openai-responses",
   );
   const selectedRuntimeAssigned = Boolean(selectedAssignment?.codingHarnessId && selectedAssignment.modelBackendId);
+
+  useEffect(() => { if (activeRun) setChatIntent("question"); }, [selectedRole, activeTaskRun?.id]);
 
   useEffect(() => {
     setRolePromptDraft(agentConfiguration?.rolePrompt ?? "");
@@ -1536,7 +1630,9 @@ function LiveView({ orchestration, runtimeAssignments, codingHarnesses, modelBac
       <div className="agent-grid">
         <div className="agent-row agents-1 director-row"><div className="agent-card director-card"><div className="agent-card-main"><span className="agent-avatar presence-director">ED</span><span className="agent-copy"><span className="agent-name-row"><strong>Engineering Director</strong><small>live</small></span><span className="agent-task">You</span></span></div></div></div>
         {teamRows.map((row, rowIndex) => <Fragment key={rowIndex}><div className={`agent-row agents-${row.length}`}>{row.map((role) => {
-        const roleRun = orchestration?.runs.find((run) => run.agentRole === role && ["queued", "provisioning", "running"].includes(run.status));
+        const runs = orchestration?.activeRuns.filter((run) => run.agentRole === role) ?? [];
+        const roleRun = runs.find(run => run.taskId) ?? runs.find(run => !run.spec.upstreamArtifacts.some(artifact => artifact.startsWith("director-question:"))) ?? runs[0];
+        const questionRun = runs.find(run => run.spec.upstreamArtifacts.some(artifact => artifact.startsWith("director-question:")));
         const activeTask = roleRun?.taskId
           ? orchestration?.tasks.find((task) => task.id === roleRun.taskId)
           : taskForRole(orchestration?.tasks ?? [], role);
@@ -1561,6 +1657,7 @@ function LiveView({ orchestration, runtimeAssignments, codingHarnesses, modelBac
               {fallbackHarness && fallbackBackend && <small title={`Fallback: ${fallbackHarness.name} · ${fallbackBackend.model ?? fallbackBackend.name}`}>↳ {fallbackBackend.model ?? fallbackBackend.name}</small>}
           </div>
           {roleRun && <div className="agent-live-activity"><span>{activity?.message ?? "Starting isolated worker…"}</span><button type="button" disabled={submitting} onClick={(event) => { event.stopPropagation(); void (roleRun.taskId ? cancelTask(roleRun.taskId) : cancelAgentRun(role, roleRun.id)); }}>Cancel</button></div>}
+          {questionRun && questionRun.id !== roleRun?.id && <div className="agent-live-activity"><span>Also answering your question</span><button type="button" disabled={submitting} onClick={() => void cancelAgentRun(role, questionRun.id)}>Cancel question</button></div>}
           {editingRuntime && <div className="agent-runtime-menu">
             <div className="agent-runtime-menu-heading"><strong>Primary runtime</strong><button type="button" onClick={() => setEditingRuntimeRole(null)} aria-label="Close runtime selector">×</button></div>
             <div className="agent-runtime-lists">
@@ -1585,9 +1682,12 @@ function LiveView({ orchestration, runtimeAssignments, codingHarnesses, modelBac
           {agentPanel === "role" && <form className="role-prompt-panel" onSubmit={(event) => { event.preventDefault(); void updateRolePrompt(selectedRole, rolePromptDraft, consultationRolesDraft); }}><div><strong>Role prompt</strong><small>{agentConfiguration?.customized ? "Customized for this project" : "Default role definition"}</small></div><textarea value={rolePromptDraft} onChange={(event) => setRolePromptDraft(event.target.value)} maxLength={8000} required/><p>This guides the agent’s behavior. Fixed container and safety rules remain separate.</p><fieldset className="consultation-role-picker"><legend>Planning collaborators</legend><small>When this role leads planning, it can ask these agents for focused advice before finalizing the plan.</small><div>{agentRoles.filter((role) => role !== selectedRole).map((role) => <label key={role}><input type="checkbox" checked={consultationRolesDraft.includes(role)} onChange={(event) => setConsultationRolesDraft((current) => event.target.checked ? [...current, role] : current.filter((candidate) => candidate !== role))}/>{roleLabels[role]}</label>)}</div></fieldset><button type="submit" disabled={submitting || !rolePromptDraft.trim() || (rolePromptDraft.trim() === agentConfiguration?.rolePrompt && JSON.stringify(consultationRolesDraft) === JSON.stringify(agentConfiguration?.consultationRoles ?? []))}>Save role</button></form>}
           {agentPanel === "directives" && <section className="directive-panel"><p>Standing instructions remembered by {roleLabels[selectedRole]}.</p>{directives.length === 0 ? <small>No standing directives yet. Tell this agent “From now on…” to add one.</small> : <div>{directives.map((directive) => <article key={directive.id}><span>{directive.content}</span><button type="button" disabled={submitting} onClick={() => void removeDirective(selectedRole, directive.id)} aria-label="Remove directive">×</button></article>)}</div>}</section>}
           {agentPanel === "memory" && <section className="agent-memory-panel"><p>Long-term agent memory will appear here.</p><small>No memories have been stored yet.</small></section>}
-          {agentPanel === "chat" && <><div className={`runtime-notice ${activeRun ? "runtime-active" : ""}`}>{activeTaskRun ? `${roleLabels[selectedRole]} is working on an active task. Sending guidance will preserve the current run, stop its container, and restart the interrupted stage with your instruction.` : activeRun ? `${roleLabels[selectedRole]} is considering your message in an isolated read-only worker.` : selectedRuntimeReady ? selectedRole === "project_manager" ? "Talk naturally, set standing directives, or describe a goal you want planned." : "Send a message to start a read-only conversation using this agent’s role, directives, and project context." : selectedRuntimeAssigned ? `The selected harness and model are not connected to ${roleLabels[selectedRole]} conversation yet. Choose an enabled Codex planning harness and OpenAI Responses model.` : `Choose a harness and model on the ${roleLabels[selectedRole]} card before starting a conversation.`}</div>
+          {agentPanel === "chat" && <><div className={`runtime-notice ${activeRun ? "runtime-active" : ""}`}>{activeTaskRun ? `${roleLabels[selectedRole]} is working on an active task. Ask a question while work continues, or select Send guidance to stop and restart the interrupted stage with your instruction.` : activeRun ? `${roleLabels[selectedRole]} is considering your message in an isolated read-only worker.` : selectedRuntimeReady ? selectedRole === "project_manager" ? "Talk naturally, set standing directives, or describe a goal you want planned." : "Send a message to start a read-only conversation using this agent’s role, directives, and project context." : selectedRuntimeAssigned ? `The selected harness and model are not connected to ${roleLabels[selectedRole]} conversation yet. Choose an enabled Codex planning harness and a Responses-compatible OpenAI or Bedrock model.` : `Choose a harness and model on the ${roleLabels[selectedRole]} card before starting a conversation.`}</div>
           <div className="message-list">{messages.length === 0 ? <div className="chat-empty"><span>⌁</span><p>Start a conversation with the {roleLabels[selectedRole]}.</p></div> : messages.map((message) => <div className={`message message-${message.author}`} key={message.id}><small>{message.author === "director" ? "You" : roleLabels[selectedRole]}</small><p>{message.body}</p><time>{new Date(message.createdAt).toLocaleString()}</time></div>)}</div>
-          <form className="chat-composer" onSubmit={(event) => void sendMessage(event)}><textarea value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} placeholder={activeTaskRun ? "Give guidance for the active task…" : selectedRole === "project_manager" ? "Talk to the Project Manager…" : `Message the ${roleLabels[selectedRole]}…`} required/><button type="submit" disabled={submitting || Boolean(activeRun && !activeTaskRun) || (!activeRun && !selectedRuntimeReady) || !chatDraft.trim()}>{activeTaskRun ? "Send guidance" : activeRun ? "Thinking…" : !selectedRuntimeReady ? "Assign runtime first" : "Send"}</button></form></>}
+          <label className="chat-intent">Conversation mode <select value={chatIntent} onChange={event => setChatIntent(event.target.value as "message" | "question")}>
+            <option value="question">Ask question — work continues</option><option value="message">{activeTaskRun ? "Send guidance — restart current stage" : "Message — planning and directives"}</option>
+          </select></label>
+          <form className="chat-composer" onSubmit={(event) => void sendMessage(event, chatIntent)}><textarea value={chatDraft} onChange={(event) => setChatDraft(event.target.value)} maxLength={2000} placeholder={chatIntent === "question" ? "Ask about progress, blockers, or the project…" : activeTaskRun ? "Give guidance for the active task…" : selectedRole === "project_manager" ? "Talk to the Project Manager…" : `Message the ${roleLabels[selectedRole]}…`} required/><button type="submit" disabled={submitting || !chatDraft.trim() || (chatIntent === "question" ? !selectedRuntimeReady || Boolean(activeQuestionRun) : Boolean(activeRun && !activeTaskRun) || (!activeRun && !selectedRuntimeReady))}>{chatIntent === "question" ? activeQuestionRun ? "Answering…" : !selectedRuntimeReady ? "Assign runtime first" : "Ask question" : activeTaskRun ? "Send guidance" : activeRun ? "Thinking…" : !selectedRuntimeReady ? "Assign runtime first" : "Send"}</button></form></>}
         </article>}</Fragment>)}</div>
     </div>
   </section>;
@@ -1620,6 +1720,7 @@ function TasksView({ project, orchestration, runtimeAssignments, reviews, select
   cancelTask: (taskId: string) => Promise<void>;
 }) {
   const pendingApprovals = orchestration?.approvals.filter((approval) => approval.status === "pending") ?? [];
+  const approvedIntegrations = orchestration?.integrationProposals.filter((proposal) => proposal.status === "approved" && proposal.application) ?? [];
   const selectedTask = orchestration?.tasks.find((task) => task.id === selectedTaskId);
   return <section className="tasks-view">
     <div className="tasks-toolbar"><div><p className="eyebrow">Project board</p><h2>Work from idea to release</h2></div><details className="plan-popover"><summary>＋ Add Task</summary><form onSubmit={(event) => void createPlan(event)}><label>Objective<input value={objectiveTitle} onChange={(event) => setObjectiveTitle(event.target.value)} required/></label><label>Description<textarea value={objectiveDescription} onChange={(event) => setObjectiveDescription(event.target.value)} required/></label><div className="draft-list">{draftTasks.map((task, index) => <fieldset key={task.key}><legend>{task.key}</legend><label>Title<input value={task.title} onChange={(event) => updateDraftTask(index, { title: event.target.value })} required/></label><div className="field-row"><label>Agent<select value={task.assignedRole} onChange={(event) => updateDraftTask(index, { assignedRole: event.target.value as AgentRole })}>{agentRoles.map((role) => <option value={role} key={role}>{roleLabels[role]}</option>)}</select></label><label>Repository<select value={task.repositoryId} onChange={(event) => updateDraftTask(index, { repositoryId: event.target.value })}><option value="">Project-wide</option>{project.repositories.filter((repository) => repository.enabled && repository.available).map((repository) => <option value={repository.id} key={repository.id}>{repository.name}</option>)}</select></label></div><label>Acceptance criteria<textarea value={task.acceptanceCriteria} onChange={(event) => updateDraftTask(index, { acceptanceCriteria: event.target.value })} placeholder="One criterion per line" required/></label><div className="required-check-fields"><span>Required checks</span><label><input type="checkbox" checked={task.requiredChecks.qa} onChange={(event) => updateDraftTask(index, { requiredChecks: { ...task.requiredChecks, qa: event.target.checked } })}/> QA</label><label><input type="checkbox" checked={task.requiredChecks.codeReview} onChange={(event) => updateDraftTask(index, { requiredChecks: { ...task.requiredChecks, codeReview: event.target.checked } })}/> Code review</label><label><input type="checkbox" checked={task.requiredChecks.security} onChange={(event) => updateDraftTask(index, { requiredChecks: { ...task.requiredChecks, security: event.target.checked } })}/> Security</label></div><label>Depends on<select value={task.dependsOn} onChange={(event) => updateDraftTask(index, { dependsOn: event.target.value })}><option value="">No dependency</option>{draftTasks.slice(0, index).map((candidate) => <option value={candidate.key} key={candidate.key}>{candidate.key}: {candidate.title || "Untitled"}</option>)}</select></label>{draftTasks.length > 1 && <button className="text-button danger" type="button" onClick={() => removeDraftTask(index)}>Remove</button>}</fieldset>)}</div><div className="form-actions"><button className="text-button" type="button" onClick={addDraftTask}>Add task</button><button className="primary-button" type="submit" disabled={submitting}>Submit for approval</button></div></form></details></div>
@@ -1627,9 +1728,20 @@ function TasksView({ project, orchestration, runtimeAssignments, reviews, select
       const contextUpdates = orchestration?.proposedContextUpdates.filter((update) => update.approvalId === approval.id) ?? [];
       return <div className="approval-item" key={approval.id}><div><span>{approval.type === "integration" ? "Release Manager · integration approval" : "Director approval"}</span><strong>{approval.title}</strong><p>{approval.details}</p>{contextUpdates.length > 0 && <div className="proposed-context-updates"><b>Knowledge updates</b>{contextUpdates.map((update) => <article key={update.id}><strong>{update.repositoryId === null ? "Project context" : `${project.repositories.find((repository) => repository.id === update.repositoryId)?.name ?? "Repository"} context`}</strong><p>{update.reason}</p><details><summary>Review proposed Markdown</summary><pre>{update.content}</pre></details></article>)}</div>}</div><textarea value={decisionNotes[approval.id] ?? ""} onChange={(event) => setDecisionNotes((current) => ({ ...current, [approval.id]: event.target.value }))} placeholder={approval.type === "integration" ? "Optional integration note" : "Optional note"}/><button className="reject" disabled={submitting} onClick={() => void decideApproval(approval.id, "rejected")}>{approval.type === "integration" ? "Reject" : "Reject"}</button><button className="approve" disabled={submitting} onClick={() => void decideApproval(approval.id, "approved")}>{approval.type === "integration" ? "Approve & apply" : "Approve"}</button></div>;
     })}</div>}
+    {approvedIntegrations.length > 0 && <div className="approval-strip">{approvedIntegrations.map((proposal) => {
+      const applying = proposal.application?.status === "applying" && Date.parse(proposal.application.leaseExpiresAt ?? "") > Date.now();
+      const approval = orchestration?.approvals.find((item) => item.id === proposal.approvalId);
+      return <div className="approval-item" key={proposal.approvalId}>
+        <div><span>Approved integration</span><strong>{approval?.title}</strong>
+          <p>{applying ? "Applying the approved changes…" : "Resume applying the approved changes."}</p>
+          {proposal.application?.lastError && <p>{proposal.application.lastError}</p>}
+        </div>
+        <button className="approve" disabled={submitting || applying} onClick={() => void decideApproval(proposal.approvalId, "approved")}>{applying ? "Applying…" : "Resume apply"}</button>
+      </div>;
+    })}</div>}
     <div className="kanban" aria-busy={loading}>{kanbanColumns.map((column) => {
       const tasks = orchestration?.tasks.filter((task) => task.status === column.status) ?? [];
-      return <section className={`kanban-column column-${column.status}`} key={column.status}><header><span>{column.label}</span><small>{tasks.length}</small></header><div className="kanban-cards">{tasks.length === 0 ? <p className="column-empty">No tasks</p> : tasks.map((task) => <TaskCard task={task} project={project} runs={orchestration?.runs ?? []} runActivities={orchestration?.runActivities ?? {}} runtimeAssignment={runtimeAssignments.find((assignment) => assignment.agentRole === task.assignedRole)} review={reviews.find((candidate) => candidate.taskId === task.id)} recovery={orchestration?.recoveries.find((candidate) => candidate.taskId === task.id)} integrationProposal={orchestration?.integrationProposals.find((candidate) => candidate.taskId === task.id)} selected={selectedTaskId === task.id} openDetails={() => showTaskDetails(task.id)} submitting={submitting} rerunTask={rerunTask} startTask={startTask} resumeTask={resumeTask} cancelTask={cancelTask} key={task.id}/>)}</div></section>;
+      return <section className={`kanban-column column-${column.status}`} key={column.status}><header><span>{column.label}</span><small>{tasks.length}</small></header><div className="kanban-cards">{tasks.length === 0 ? <p className="column-empty">No tasks</p> : tasks.map((task) => <TaskCard task={task} project={project} runs={orchestration?.taskRuns[task.id] ?? []} runActivities={orchestration?.runActivities ?? {}} runtimeAssignment={runtimeAssignments.find((assignment) => assignment.agentRole === task.assignedRole)} review={reviews.find((candidate) => candidate.taskId === task.id)} recovery={orchestration?.recoveries.find((candidate) => candidate.taskId === task.id)} integrationProposal={orchestration?.integrationProposals.find((candidate) => candidate.taskId === task.id)} selected={selectedTaskId === task.id} openDetails={() => showTaskDetails(task.id)} submitting={submitting} rerunTask={rerunTask} startTask={startTask} resumeTask={resumeTask} cancelTask={cancelTask} key={task.id}/>)}</div></section>;
     })}</div>
     {selectedTask && <TaskWorkflowPanel project={project} task={selectedTask} review={reviews.find((candidate) => candidate.taskId === selectedTask.id)} recovery={orchestration?.recoveries.find((candidate) => candidate.taskId === selectedTask.id)} integrationProposal={orchestration?.integrationProposals.find((candidate) => candidate.taskId === selectedTask.id)} integrationApproval={orchestration?.approvals.find((candidate) => candidate.id === orchestration?.integrationProposals.find((proposal) => proposal.taskId === selectedTask.id)?.approvalId)} submitting={submitting} resumeTask={resumeTask} close={() => showTaskDetails(null)} />}
   </section>;
@@ -1637,7 +1749,7 @@ function TasksView({ project, orchestration, runtimeAssignments, reviews, select
 
 function TaskCard({ task, project, runs, runActivities, runtimeAssignment, review, recovery, integrationProposal, selected, openDetails, submitting, rerunTask, startTask, resumeTask, cancelTask }: { task: TaskSummary; project: ProjectSummary; runs: OrchestrationState["runs"]; runActivities: OrchestrationState["runActivities"]; runtimeAssignment: AgentRuntimeAssignmentSummary | undefined; review: TaskReviewSummary | undefined; recovery: OrchestrationState["recoveries"][number] | undefined; integrationProposal: OrchestrationState["integrationProposals"][number] | undefined; selected: boolean; openDetails: () => void; submitting: boolean; rerunTask: (taskId: string) => Promise<void>; startTask: (taskId: string, runtime?: "primary" | "fallback") => Promise<void>; resumeTask: (taskId: string, stage: TaskWorkflowRecoveryStage) => Promise<void>; cancelTask: (taskId: string) => Promise<void> }) {
   const taskRuns = runs.filter((run) => run.taskId === task.id);
-  const activeRun = taskRuns.find((run) => ["queued", "provisioning", "running"].includes(run.status));
+  const activeRun = taskRuns.find((run) => ["queued", "provisioning", "running", "waiting"].includes(run.status));
   const latestRun = taskRuns[0];
   const implementationRun = taskRuns.find((run) => ["implementation", "repair"].includes(run.spec.runPurpose ?? "implementation") && (run.result?.commits.length ?? 0) > 0);
   const repositoryNames = task.repositoryIds.map((id) => project.repositories.find((repository) => repository.id === id)?.name).filter(Boolean);
@@ -1649,7 +1761,7 @@ function TaskCard({ task, project, runs, runActivities, runtimeAssignment, revie
   ].filter((check) => check.required).map((check) => {
     const checkRuns = taskRuns.filter((run) => run.spec.runPurpose === "verification" && run.spec.verificationCheck === check.key && (!implementationRun || run.spec.upstreamArtifacts.includes(`implementation-run:${implementationRun.id}`)));
     const run = checkRuns[0];
-    const status = run && ["queued", "provisioning", "running"].includes(run.status)
+    const status = run && ["queued", "provisioning", "running", "waiting"].includes(run.status)
       ? "running"
       : run?.status === "completed" && run.result?.status === "completed"
         ? "passed"
@@ -1663,8 +1775,8 @@ function TaskCard({ task, project, runs, runActivities, runtimeAssignment, revie
   const displayedResult = implementationRun?.result ?? latestRun?.result;
   const liveActivity = activeRun ? runActivities[activeRun.id] : undefined;
   const handleAction = (event: MouseEvent<HTMLButtonElement>, action: () => Promise<void>) => { event.stopPropagation(); void action(); };
-  const integrationLabel = integrationProposal?.status === "pending" ? "Awaiting Director approval" : integrationProposal?.status === "rejected" ? "Integration rejected" : integrationProposal?.status === "applied" ? "Applied" : review?.state === "stale" ? "Stale branch" : review?.state === "applicable" ? "Release assessment pending" : review?.state === "applied" ? "Applied" : "Evidence report";
-  return <article className={`kanban-card task-card-clickable ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-expanded={selected} onClick={openDetails} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openDetails(); } }}><div className="card-tags"><span>{repositoryNames.length ? repositoryNames.join(" · ") : "Project-wide"}</span><small>View details</small></div><h3>{task.title}</h3><p>{task.description || task.acceptanceCriteria[0]}</p>{recovery && <div className="task-recovery-notice"><strong>Workflow interrupted</strong><span>{recovery.stage.replaceAll("_", " ")} can resume without discarding completed evidence.</span></div>}{activeRun && <small className="task-live-activity">{liveActivity?.message ?? "Starting isolated worker…"}</small>}{requiredChecks.length > 0 && <div className="task-required-checks" aria-label="Required checks">{requiredChecks.map((check) => <span className={check.status} title={check.summary} key={check.key}>{check.label} · {check.status}</span>)}</div>}{displayedResult && <small className={`task-run-result ${displayedResult.status}`}>{displayedResult.summary}</small>}{review && <small className={`task-review-status ${integrationProposal?.status ?? review.state}`}><strong>{integrationLabel}</strong><span>{integrationProposal?.status === "pending" ? "The Release Manager proposal is ready in Director approvals." : review.message}</span></small>}{branches.length > 0 && <div className="task-branches"><span>{review?.state === "applied" ? "Applied branch" : "Branch"}</span>{branches.map((branch) => <code className={review?.state === "applied" ? "applied" : ""} key={branch}>{branch}</code>)}</div>}<footer><span className="mini-avatar">{roleInitials[task.assignedRole]}</span><small>{roleLabels[task.assignedRole]}</small></footer>{recovery && <button className="task-action recovery" disabled={submitting} onClick={(event) => handleAction(event, () => resumeTask(task.id, recovery.stage))}>Resume workflow</button>}{!recovery && task.status === "ready" && <button className="task-action" disabled={submitting} onClick={(event) => handleAction(event, () => startTask(task.id))}>Start</button>}{!recovery && task.status === "in_progress" && (activeRun ? <button className="task-action cancel" disabled={submitting} onClick={(event) => handleAction(event, () => cancelTask(task.id))}>Cancel run</button> : <><button className="task-action" disabled={submitting} onClick={(event) => handleAction(event, () => startTask(task.id))}>{hasFailedCheck ? "Repair and re-check" : latestRun?.status === "failed" ? "Retry primary" : "Run agent"}</button>{latestRun?.status === "failed" && hasFallbackRuntime && <button className="task-action fallback" disabled={submitting} onClick={(event) => handleAction(event, () => startTask(task.id, "fallback"))}>Retry with fallback</button>}</>)}{integrationProposal?.status === "rejected" && <button className="task-action rerun" disabled={submitting} onClick={(event) => handleAction(event, () => rerunTask(task.id))}>Revise and re-check</button>}{integrationProposal?.status !== "rejected" && ["review", "completed"].includes(task.status) && review?.state === "stale" && <button className="task-action rerun" disabled={submitting} onClick={(event) => handleAction(event, () => rerunTask(task.id))}>Re-run on current</button>}</article>;
+  const integrationLabel = integrationProposal?.status === "superseded" ? "Previous proposal superseded" : integrationProposal?.status === "approved" ? "Integration approved" : integrationProposal?.status === "pending" ? "Awaiting Director approval" : integrationProposal?.status === "rejected" ? "Integration rejected" : integrationProposal?.status === "applied" ? "Applied" : review?.state === "stale" ? "Stale branch" : review?.state === "applicable" ? "Release assessment pending" : review?.state === "applied" ? "Applied" : "Evidence report";
+  return <article className={`kanban-card task-card-clickable ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-expanded={selected} onClick={openDetails} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openDetails(); } }}><div className="card-tags"><span>{repositoryNames.length ? repositoryNames.join(" · ") : "Project-wide"}</span><small>View details</small></div><h3>{task.title}</h3><p>{task.description || task.acceptanceCriteria[0]}</p>{recovery && <div className="task-recovery-notice"><strong>Workflow interrupted</strong><span>{recovery.stage.replaceAll("_", " ")} can resume without discarding completed evidence.</span></div>}{activeRun && <small className="task-live-activity">{liveActivity?.message ?? "Starting isolated worker…"}</small>}{requiredChecks.length > 0 && <div className="task-required-checks" aria-label="Required checks">{requiredChecks.map((check) => <span className={check.status} title={check.summary} key={check.key}>{check.label} · {check.status}</span>)}</div>}{displayedResult && <small className={`task-run-result ${displayedResult.status}`}>{displayedResult.summary}</small>}{review && <small className={`task-review-status ${integrationProposal?.status ?? review.state}`}><strong>{integrationLabel}</strong><span>{integrationProposal?.status === "superseded" ? "A new implementation needs a fresh release assessment and approval." : integrationProposal?.status === "pending" ? "The Release Manager proposal is ready in Director approvals." : integrationProposal?.status === "approved" ? "Apply progress and recovery are available in Director approvals." : review.message}</span></small>}{branches.length > 0 && <div className="task-branches"><span>{review?.state === "applied" ? "Applied branch" : "Branch"}</span>{branches.map((branch) => <code className={review?.state === "applied" ? "applied" : ""} key={branch}>{branch}</code>)}</div>}<footer><span className="mini-avatar">{roleInitials[task.assignedRole]}</span><small>{roleLabels[task.assignedRole]}</small></footer>{recovery && <button className="task-action recovery" disabled={submitting} onClick={(event) => handleAction(event, () => resumeTask(task.id, recovery.stage))}>Resume workflow</button>}{!recovery && task.status === "ready" && <button className="task-action" disabled={submitting} onClick={(event) => handleAction(event, () => startTask(task.id))}>Start</button>}{!recovery && task.status === "in_progress" && (activeRun ? <button className="task-action cancel" disabled={submitting} onClick={(event) => handleAction(event, () => cancelTask(task.id))}>Cancel run</button> : <><button className="task-action" disabled={submitting} onClick={(event) => handleAction(event, () => startTask(task.id))}>{hasFailedCheck ? "Repair and re-check" : latestRun?.status === "failed" ? "Retry primary" : "Run agent"}</button>{latestRun?.status === "failed" && hasFallbackRuntime && <button className="task-action fallback" disabled={submitting} onClick={(event) => handleAction(event, () => startTask(task.id, "fallback"))}>Retry with fallback</button>}</>)}{integrationProposal?.status === "rejected" && <button className="task-action rerun" disabled={submitting} onClick={(event) => handleAction(event, () => rerunTask(task.id))}>Revise and re-check</button>}{integrationProposal?.status !== "rejected" && integrationProposal?.status !== "approved" && ["review", "completed"].includes(task.status) && review?.state === "stale" && <button className="task-action rerun" disabled={submitting} onClick={(event) => handleAction(event, () => rerunTask(task.id))}>Re-run on current</button>}</article>;
 }
 
 function TaskWorkflowPanel({ project, task, review, recovery, integrationProposal, integrationApproval, submitting, resumeTask, close }: { project: ProjectSummary; task: TaskSummary; review: TaskReviewSummary | undefined; recovery: OrchestrationState["recoveries"][number] | undefined; integrationProposal: OrchestrationState["integrationProposals"][number] | undefined; integrationApproval: OrchestrationState["approvals"][number] | undefined; submitting: boolean; resumeTask: (taskId: string, stage: TaskWorkflowRecoveryStage) => Promise<void>; close: () => void }) {
@@ -1714,10 +1826,10 @@ function TaskWorkflowPanel({ project, task, review, recovery, integrationProposa
       <header className="task-detail-header"><div><p className="eyebrow">Task workflow</p><h2 id="task-detail-title">{task.title}</h2><div className="task-detail-meta"><span className={`workflow-status ${task.status}`}>{task.status.replaceAll("_", " ")}</span><span>{repositoryNames.length ? repositoryNames.join(" · ") : "Project-wide"}</span><span>{roleLabels[task.assignedRole]}</span></div></div><div className="task-detail-header-actions">{recovery && <button className="resume-workflow" type="button" disabled={submitting} onClick={() => void resumeTask(task.id, recovery.stage)}>Resume workflow</button>}<button className="task-detail-close" type="button" onClick={close} aria-label="Close task details">×</button></div></header>
       <div className="task-detail-body">
         {recovery && <section className="task-recovery-banner"><div><strong>Workflow interrupted during {recovery.stage.replaceAll("_", " ")}</strong><p>{recovery.reason}</p></div><span>Completed checks and artifacts are preserved. Resume continues from the last durable stage.</span></section>}
-        {integrationProposal && <section className={`task-integration-proposal ${integrationProposal.status}`}><div><strong>Release Manager · {integrationProposal.status}</strong><p>{integrationApproval?.title ?? "Integration proposal"}</p></div><span>{integrationProposal.status === "pending" ? "Review this proposal in Director approvals above the board. Nothing is applied until you approve it." : integrationProposal.status === "rejected" ? "The repositories were not changed." : integrationProposal.status === "applied" ? "The approved commits were applied to the target branches." : "Integration is approved."}</span>{integrationApproval?.details && <pre>{integrationApproval.details}</pre>}</section>}
+        {integrationProposal && <section className={`task-integration-proposal ${integrationProposal.status}`}><div><strong>Release Manager · {integrationProposal.status}</strong><p>{integrationApproval?.title ?? "Integration proposal"}</p></div><span>{integrationProposal.status === "superseded" ? "This historical proposal cannot authorize the current work. A replacement implementation requires a new assessment and approval." : integrationProposal.status === "pending" ? "Review this proposal in Director approvals above the board. Nothing is applied until you approve it." : integrationProposal.status === "rejected" ? "The repositories were not changed." : integrationProposal.status === "applied" ? "The approved commits were applied to the target branches." : "Integration is approved."}</span>{integrationApproval?.details && <pre>{integrationApproval.details}</pre>}</section>}
         <section className="task-detail-summary"><div><h3>Objective</h3><p>{task.description || "No additional task description."}</p></div><div><h3>Acceptance criteria</h3><ul>{task.acceptanceCriteria.map((criterion) => <li key={criterion}>{criterion}</li>)}</ul></div></section>
         <section className="task-detail-metrics"><div><strong>{runs.length}</strong><span>agent runs</span></div><div><strong>{formatCompactNumber(totalInputTokens + totalOutputTokens)}</strong><span>tokens</span></div><div><strong>{formatDuration(totalDuration)}</strong><span>model time</span></div><div><strong>{integrationProposal?.status === "pending" ? "Approval" : integrationProposal?.status === "applied" ? "Applied" : review?.state === "stale" ? "Stale" : task.status === "in_progress" ? "Active" : "—"}</strong><span>integration</span></div></section>
-        {review && <div className={`task-detail-review ${integrationProposal?.status ?? review.state}`}><strong>{integrationProposal?.status === "pending" ? "Release proposal awaiting Director approval" : integrationProposal?.status === "rejected" ? "Integration rejected" : integrationProposal?.status === "applied" ? "Approved changes applied" : review.state === "stale" ? "Integration branch is stale" : review.state === "applicable" ? "Verified; Release Manager assessment required" : "Evidence-only result"}</strong><span>{review.message}</span></div>}
+        {review && <div className={`task-detail-review ${integrationProposal?.status ?? review.state}`}><strong>{integrationProposal?.status === "superseded" ? "Previous integration proposal superseded" : integrationProposal?.status === "pending" ? "Release proposal awaiting Director approval" : integrationProposal?.status === "rejected" ? "Integration rejected" : integrationProposal?.status === "applied" ? "Approved changes applied" : review.state === "stale" ? "Integration branch is stale" : review.state === "applicable" ? "Verified; Release Manager assessment required" : "Evidence-only result"}</strong><span>{review.message}</span></div>}
         {loading && <div className="task-detail-empty">Loading workflow…</div>}
         {error && <div className="task-detail-error">{error}</div>}
         {!loading && !error && runs.length === 0 && <div className="task-detail-empty"><strong>No agent runs yet</strong><span>The workflow timeline will appear after this task starts.</span></div>}

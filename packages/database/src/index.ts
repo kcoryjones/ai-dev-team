@@ -10,7 +10,13 @@ import type {
   AgentConfigurationSummary,
   AgentMessageAuthor,
   AgentMessageSummary,
+  AgentQuestionResponse,
+  VoiceCommandInput,
+  VoiceCommandPreview,
+  VoiceCommandReceipt,
   AgentRole,
+  ApplyCodingRunRequest,
+  ApplyCodingRunResponse,
   ApprovalStatus,
   ApprovalSummary,
   ApprovalType,
@@ -54,6 +60,7 @@ import type {
 } from "@engineering-team/contracts";
 import { agentRoles, defaultAgentConsultationRoles, defaultAgentRolePrompts, runContractSchemaVersion } from "@engineering-team/contracts";
 import { migrate } from "./migrations.js";
+import { assertTaskReviewEvidence } from "./task-evidence.js";
 
 interface ProjectRow {
   id: string;
@@ -134,6 +141,7 @@ interface ApprovalRow {
   title: string;
   details: string;
   status: ApprovalStatus;
+  superseded_at: string | null;
   requested_by_role: AgentRole;
   requested_at: string;
   decided_at: string | null;
@@ -285,9 +293,23 @@ interface IntegrationProposalRow {
   change_run_id: string;
   release_run_id: string;
   status: IntegrationProposalSummary["status"];
+  superseded_at: string | null;
   created_at: string;
   decided_at: string | null;
   applied_at: string | null;
+  application_status?: "applying" | "retryable" | "applied" | null;
+  application_lease_expires_at?: string | null;
+  application_last_error?: string | null;
+}
+
+interface IntegrationApplicationRow {
+  approval_id: string;
+  request_json: string;
+  result_json: string | null;
+  status: "applying" | "retryable" | "applied";
+  lease_token: string | null;
+  lease_expires_at: string | null;
+  last_error: string | null;
 }
 
 interface ProjectSettingsRow {
@@ -314,6 +336,7 @@ interface ModelBackendRow {
   base_url: string | null;
   auth_mode: ModelBackendSummary["authMode"];
   credential_ref: string | null;
+  configuration_json: string;
   enabled: 0 | 1;
   created_at: string;
   updated_at: string;
@@ -616,19 +639,20 @@ export class TeamDatabase {
         .prepare(
           `INSERT INTO model_backends
             (id, project_id, name, provider, protocol, model, base_url, auth_mode,
-             credential_ref, enabled, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             credential_ref, configuration_json, enabled, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           backendId,
           projectId,
           input.name,
-          input.provider,
+          storedModelBackendProvider(input.provider),
           input.protocol,
           input.model ?? null,
           input.baseUrl ?? null,
-          input.authMode,
+          storedModelBackendAuthMode(input.authMode),
           input.credentialRef ?? null,
+          JSON.stringify(input.configuration ?? {}),
           input.enabled === false ? 0 : 1,
           now,
           now,
@@ -669,17 +693,18 @@ export class TeamDatabase {
       .prepare(
         `UPDATE model_backends SET
           name = ?, provider = ?, protocol = ?, model = ?, base_url = ?, auth_mode = ?,
-          credential_ref = ?, enabled = ?, updated_at = ?
+          credential_ref = ?, configuration_json = ?, enabled = ?, updated_at = ?
          WHERE project_id = ? AND id = ?`,
       )
       .run(
         input.name,
-        input.provider,
+        storedModelBackendProvider(input.provider),
         input.protocol,
         input.model ?? null,
         input.baseUrl ?? null,
-        input.authMode,
+        storedModelBackendAuthMode(input.authMode),
         input.credentialRef ?? null,
+        JSON.stringify(input.configuration ?? {}),
         input.enabled === false ? 0 : 1,
         now,
         projectId,
@@ -1206,24 +1231,34 @@ export class TeamDatabase {
     const agentConfigurations = this.getAgentConfigurations(projectId);
 
     const runs = this.listAgentRuns(projectId);
-    const runActivities = Object.fromEntries(runs.flatMap((run) => {
-      const event = this.listRunEvents(run.id).at(-1);
-      return event ? [[run.id, event]] : [];
+    const activeRuns = this.listActiveAgentRuns(projectId);
+    const taskRuns = Object.fromEntries(tasks.map(task => [task.id, this.listTaskCardRuns(projectId, task.id, activeRuns)]));
+    const activityRuns = new Map([...runs, ...activeRuns].map(run => [run.id, run]));
+    const runActivities = Object.fromEntries([...activityRuns.values()].flatMap((run) => {
+      const event = this.connection.prepare("SELECT * FROM agent_run_events WHERE run_id = ? ORDER BY sequence DESC LIMIT 1")
+        .get(run.id) as RunEventRow | undefined;
+      return event ? [[run.id, mapRunEventRow(event)]] : [];
     }));
     const recoveries = this.listTaskWorkflowRecoveries(projectId);
     const integrationProposals = this.listIntegrationProposals(projectId);
-    return { project, objectives, tasks, approvals, contexts, contextRevisions, proposedContextUpdates, messages, directives, agentConfigurations, runs, runActivities, recoveries, integrationProposals };
+    return { project, objectives, tasks, approvals, contexts, contextRevisions, proposedContextUpdates, messages, directives, agentConfigurations, runs, activeRuns, taskRuns, runActivities, recoveries, integrationProposals };
   }
 
   listIntegrationProposals(projectId: string): IntegrationProposalSummary[] {
     return (this.connection
-      .prepare("SELECT * FROM task_integration_proposals WHERE project_id = ? ORDER BY created_at DESC")
+      .prepare(`SELECT p.*, a.status AS application_status, a.lease_expires_at AS application_lease_expires_at,
+        a.last_error AS application_last_error FROM task_integration_proposals p
+        LEFT JOIN integration_applications a ON a.approval_id = p.approval_id
+        WHERE p.project_id = ? ORDER BY p.created_at DESC, p.rowid DESC`)
       .all(projectId) as IntegrationProposalRow[]).map(mapIntegrationProposalRow);
   }
 
   getIntegrationProposal(projectId: string, approvalId: string): IntegrationProposalSummary | null {
     const row = this.connection
-      .prepare("SELECT * FROM task_integration_proposals WHERE project_id = ? AND approval_id = ?")
+      .prepare(`SELECT p.*, a.status AS application_status, a.lease_expires_at AS application_lease_expires_at,
+        a.last_error AS application_last_error FROM task_integration_proposals p
+        LEFT JOIN integration_applications a ON a.approval_id = p.approval_id
+        WHERE p.project_id = ? AND p.approval_id = ?`)
       .get(projectId, approvalId) as IntegrationProposalRow | undefined;
     return row ? mapIntegrationProposalRow(row) : null;
   }
@@ -1242,8 +1277,20 @@ export class TeamDatabase {
       const task = this.connection.prepare("SELECT objective_id FROM tasks WHERE id = ? AND project_id = ?")
         .get(record.taskId, record.projectId) as { objective_id: string } | undefined;
       if (!task) throw new Error("Task not found");
+      this.assertNoUnfinishedIntegration(record.taskId);
+      const { runs } = this.getTaskWorkflowContext(record.projectId, record.taskId);
+      const change = runs.find(run => ["implementation", "repair"].includes(run.spec.runPurpose ?? "implementation"));
+      const release = runs.find(run => run.spec.runPurpose === "release" && run.spec.upstreamArtifacts.includes(`implementation-run:${record.changeRunId}`));
+      if (change?.id !== record.changeRunId || change.status !== "completed" || change.result?.status !== "completed" || !change.result.commits.length ||
+          release?.id !== record.releaseRunId || release.status !== "completed" || release.result?.status !== "completed" || release.agentRole !== "release_manager" ||
+          release.spec.repositories.length !== change.spec.repositories.length ||
+          change.spec.repositories.some(repo => release.spec.repositories.find(item => item.repositoryId === repo.repositoryId)?.baseCommit !==
+            (change.result!.commits.find(commit => commit.repositoryId === repo.repositoryId)?.sha ?? repo.baseCommit))) {
+        throw new Error("Integration proposal must reference the current implementation and its exact release assessment");
+      }
+      this.supersedeTaskIntegrationProposals(record.projectId, record.taskId, "Replaced by the current implementation and release assessment", now, { changeRunId: record.changeRunId, releaseRunId: record.releaseRunId });
       const pending = this.connection.prepare(
-        "SELECT 1 FROM task_integration_proposals WHERE task_id = ? AND status IN ('pending', 'approved') LIMIT 1",
+        "SELECT 1 FROM task_integration_proposals WHERE task_id = ? AND superseded_at IS NULL AND status IN ('pending', 'approved') LIMIT 1",
       ).get(record.taskId);
       if (pending) throw new Error("An integration proposal is already awaiting a decision");
       this.connection.prepare(
@@ -1271,12 +1318,204 @@ export class TeamDatabase {
   markIntegrationProposalApplied(projectId: string, approvalId: string): IntegrationProposalSummary {
     const now = new Date().toISOString();
     const result = this.connection.prepare(
-      "UPDATE task_integration_proposals SET status = 'applied', applied_at = ?, decided_at = COALESCE(decided_at, ?) WHERE project_id = ? AND approval_id = ? AND status = 'approved'",
+      "UPDATE task_integration_proposals SET status = 'applied', applied_at = ?, decided_at = COALESCE(decided_at, ?) WHERE project_id = ? AND approval_id = ? AND status = 'approved' AND superseded_at IS NULL",
     ).run(now, now, projectId, approvalId);
     if (result.changes !== 1) throw new Error("Approved integration proposal not found");
     const proposal = this.getIntegrationProposal(projectId, approvalId);
     if (!proposal) throw new Error("Integration proposal could not be read back");
     return proposal;
+  }
+
+  // The approval and immutable request are committed together before any repository side effects.
+  // A lease admits one API caller; controller receipts make takeover after a crash idempotent.
+  claimIntegrationApplication(
+    projectId: string, approvalId: string, note: string | null,
+    buildRequest: () => ApplyCodingRunRequest, leaseToken: string, leaseExpiresAt: string,
+  ): { request: ApplyCodingRunRequest; result: ApplyCodingRunResponse | null } {
+    return this.connection.transaction(() => {
+      const approval = this.getApproval(projectId, approvalId);
+      const proposal = this.getIntegrationProposal(projectId, approvalId);
+      if (!approval || approval.type !== "integration" || !proposal) throw new Error("Integration proposal not found");
+      const existing = this.connection.prepare("SELECT * FROM integration_applications WHERE approval_id = ?")
+        .get(approvalId) as IntegrationApplicationRow | undefined;
+      const now = new Date().toISOString();
+      if (existing) {
+        if (approval.status !== "approved") throw new Error("Integration has not been approved");
+        if (existing.status === "applied") {
+          return { request: JSON.parse(existing.request_json), result: JSON.parse(existing.result_json!) };
+        }
+        if (existing.status === "applying" && existing.lease_expires_at! > now) {
+          throw new Error("This approved integration is already being applied");
+        }
+        if (proposal.status !== "approved") throw new Error("Integration proposal is no longer approved");
+        this.connection.prepare(`UPDATE integration_applications SET status = 'applying', lease_token = ?,
+          lease_expires_at = ?, last_error = NULL, updated_at = ? WHERE approval_id = ?`)
+          .run(leaseToken, leaseExpiresAt, now, approvalId);
+        return { request: JSON.parse(existing.request_json), result: null };
+      }
+      if (approval.status !== "pending" || proposal.status !== "pending") {
+        throw new Error("Approval request has already been decided");
+      }
+      const task = this.connection.prepare("SELECT * FROM tasks WHERE id = ? AND project_id = ?")
+        .get(proposal.taskId, projectId) as TaskRow | undefined;
+      const latest = this.connection.prepare(`SELECT id FROM agent_runs WHERE project_id = ? AND task_id = ?
+        AND COALESCE(json_extract(run_spec_json, '$.runPurpose'), 'implementation') IN ('implementation', 'repair')
+        ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(projectId, proposal.taskId) as { id: string } | undefined;
+      const active = this.connection.prepare(`SELECT 1 FROM agent_runs WHERE project_id = ? AND task_id = ?
+        AND status IN ('queued', 'provisioning', 'running', 'waiting') LIMIT 1`).get(projectId, proposal.taskId);
+      const run = this.getAgentRun(proposal.changeRunId);
+      const release = this.getAgentRun(proposal.releaseRunId);
+      if (task?.status !== "review" || active || latest?.id !== proposal.changeRunId) {
+        throw new Error("Integration proposal has been superseded or its task is not ready for integration");
+      }
+      const evidence = this.assertTaskCanAdvance(task, false);
+      if (evidence.release?.id !== proposal.releaseRunId) {
+        throw new Error("Integration proposal no longer matches the current release assessment");
+      }
+      if (run?.status !== "completed" || run.result?.status !== "completed" ||
+          release?.status !== "completed" || release.result?.status !== "completed" ||
+          release.projectId !== projectId || release.taskId !== proposal.taskId || release.spec.runPurpose !== "release" ||
+          !release.spec.upstreamArtifacts.includes(`implementation-run:${run.id}`) ||
+          !run.result.commits.length || run.result.commits.some((commit) =>
+            release.spec.repositories.find((repo) => repo.repositoryId === commit.repositoryId)?.baseCommit !== commit.sha)) {
+        throw new Error("The verified implementation for this proposal is unavailable");
+      }
+      const request = buildRequest();
+      if (request.approvalId !== approvalId || request.taskId !== proposal.taskId || request.runId !== run.id ||
+          request.repositories.length !== run.result.commits.length ||
+          new Set(request.repositories.map((repo) => repo.repositoryId)).size !== request.repositories.length ||
+          request.repositories.some((repo) => {
+            const spec = run.spec.repositories.find((item) => item.repositoryId === repo.repositoryId);
+            return !spec || !repo.targetBranch || repo.baseCommit !== (spec.integrationBaseCommit ?? spec.baseCommit) ||
+              run.result!.commits.find((commit) => commit.repositoryId === repo.repositoryId)?.sha !== repo.sha;
+          })) throw new Error("Integration request does not match the approved implementation");
+      this.decideApproval(projectId, approvalId, "approved", note);
+      this.connection.prepare(`INSERT INTO integration_applications
+        (approval_id, request_json, status, lease_token, lease_expires_at, created_at, updated_at)
+        VALUES (?, ?, 'applying', ?, ?, ?, ?)`)
+        .run(approvalId, JSON.stringify(request), leaseToken, leaseExpiresAt, now, now);
+      return { request, result: null };
+    }).immediate();
+  }
+
+  renewIntegrationApplication(approvalId: string, leaseToken: string, leaseExpiresAt: string): void {
+    this.connection.prepare(`UPDATE integration_applications SET lease_expires_at = ?, updated_at = ?
+      WHERE approval_id = ? AND lease_token = ? AND status = 'applying'`)
+      .run(leaseExpiresAt, new Date().toISOString(), approvalId, leaseToken);
+  }
+
+  failIntegrationApplication(approvalId: string, leaseToken: string, message: string): void {
+    this.connection.prepare(`UPDATE integration_applications SET status = 'retryable', lease_token = NULL,
+      lease_expires_at = NULL, last_error = ?, updated_at = ?
+      WHERE approval_id = ? AND lease_token = ? AND status = 'applying'`)
+      .run(message, new Date().toISOString(), approvalId, leaseToken);
+  }
+
+  completeIntegrationApplication(projectId: string, approvalId: string, leaseToken: string, result: ApplyCodingRunResponse): void {
+    this.connection.transaction(() => {
+      const proposal = this.getIntegrationProposal(projectId, approvalId);
+      const application = this.connection.prepare("SELECT * FROM integration_applications WHERE approval_id = ?")
+        .get(approvalId) as IntegrationApplicationRow | undefined;
+      if (!proposal || application?.status !== "applying" || application.lease_token !== leaseToken) {
+        throw new Error("Integration apply lease is no longer owned by this request");
+      }
+      const request = JSON.parse(application.request_json) as ApplyCodingRunRequest;
+      if (result.applied.length !== request.repositories.length ||
+          new Set(result.applied.map((item) => item.repositoryId)).size !== request.repositories.length ||
+          request.repositories.some((repo) => !result.applied.some((item) => item.repositoryId === repo.repositoryId &&
+            item.sha === repo.sha && item.branch === repo.branch && item.targetBranch === repo.targetBranch))) {
+        throw new Error("Controller did not confirm the complete approved integration");
+      }
+      this.connection.prepare(`UPDATE integration_applications SET status = 'applied', result_json = ?,
+        lease_token = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = ? WHERE approval_id = ?`)
+        .run(JSON.stringify(result), new Date().toISOString(), approvalId);
+      this.markRunBranchesApplied(request.runId, result.applied.map((item) => item.branch));
+      this.markIntegrationProposalApplied(projectId, approvalId);
+      this.updateTaskStatus(projectId, proposal.taskId, "completed");
+      this.createAgentMessage({
+        id: randomUUID(), projectId, agentRole: "release_manager", author: "system",
+        body: `Director approved integration. Applied ${result.applied.map((item) => `${item.branch} to ${item.targetBranch}`).join(", ")}.`,
+      });
+    }).immediate();
+  }
+
+  private assertNoUnfinishedIntegration(taskId: string): void {
+    const unfinished = this.connection.prepare(`SELECT 1 FROM integration_applications a
+      JOIN task_integration_proposals p ON p.approval_id = a.approval_id
+      WHERE p.task_id = ? AND a.status <> 'applied' LIMIT 1`).get(taskId);
+    if (unfinished) throw new Error("Resume the approved integration before changing or rerunning this task");
+  }
+
+  private supersedeTaskIntegrationProposals(projectId: string, taskId: string, reason: string, now: string,
+    keep?: { changeRunId: string; releaseRunId: string }): void {
+    this.assertNoUnfinishedIntegration(taskId);
+    const proposals = (this.connection.prepare(`SELECT * FROM task_integration_proposals
+      WHERE project_id = ? AND task_id = ? AND superseded_at IS NULL`).all(projectId, taskId) as IntegrationProposalRow[])
+      .filter(row => !keep || row.change_run_id !== keep.changeRunId || row.release_run_id !== keep.releaseRunId);
+    for (const proposal of proposals) {
+      this.connection.prepare("UPDATE task_integration_proposals SET superseded_at = ? WHERE approval_id = ?").run(now, proposal.approval_id);
+      this.connection.prepare("UPDATE approval_requests SET superseded_at = ? WHERE id = ?").run(now, proposal.approval_id);
+      this.recordEvent(projectId, "integration.superseded", "approval", proposal.approval_id, { taskId, changeRunId: proposal.change_run_id, reason }, now);
+    }
+  }
+
+  getTaskWorkflowContext(projectId: string, taskId: string): {
+    runs: AgentRunSummary[]; rejectedChangeRunId: string | null; directorFeedback: string | null;
+  } {
+    const requeue = this.connection.prepare(`SELECT id, payload_json FROM events
+      WHERE project_id = ? AND entity_id = ? AND event_type = 'task.requeued' ORDER BY id DESC LIMIT 1`)
+      .get(projectId, taskId) as { id: number; payload_json: string } | undefined;
+    const context = requeue ? JSON.parse(requeue.payload_json) as { rejectedChangeRunId?: string; directorFeedback?: string } : {};
+    const runs = (this.connection.prepare(`SELECT ar.* FROM agent_runs ar WHERE ar.project_id = ? AND ar.task_id = ?
+      AND (? IS NULL OR EXISTS (SELECT 1 FROM events e WHERE e.project_id = ar.project_id AND e.entity_id = ar.id
+        AND e.event_type = 'agent.run_created' AND e.id > ?)) ORDER BY ar.created_at DESC, ar.rowid DESC`)
+      .all(projectId, taskId, requeue?.id ?? null, requeue?.id ?? null) as AgentRunRow[]).map(mapAgentRunRow);
+    return { runs, rejectedChangeRunId: context.rejectedChangeRunId ?? null, directorFeedback: context.directorFeedback ?? null };
+  }
+
+  private assertTaskCanAdvance(task: TaskRow, completing: boolean): ReturnType<typeof assertTaskReviewEvidence> {
+    const plan = this.connection.prepare(`SELECT 1 FROM approval_requests
+      WHERE project_id = ? AND objective_id = ? AND approval_type = 'plan' AND status = 'approved' LIMIT 1`)
+      .get(task.project_id, task.objective_id);
+    if (!plan) throw new Error("Task requires an approved plan before review or completion");
+    const repositoryIds = (this.connection.prepare("SELECT repository_id FROM task_repositories WHERE task_id = ?")
+      .all(task.id) as Array<{ repository_id: string }>).map(row => row.repository_id);
+    const evidence = assertTaskReviewEvidence({
+      assignedRole: task.assigned_role, repositoryIds,
+      acceptanceCriteria: JSON.parse(task.acceptance_criteria_json) as string[],
+      requiredChecks: JSON.parse(task.required_checks_json) as TaskRequiredChecks,
+    }, this.listAgentRunsForTask(task.project_id, task.id));
+    const { implementation, release } = evidence;
+    const requeued = this.connection.prepare(`SELECT id FROM events WHERE project_id = ?
+      AND entity_id = ? AND event_type = 'task.requeued' ORDER BY id DESC LIMIT 1`)
+      .get(task.project_id, task.id) as { id: number } | undefined;
+    if (requeued) {
+      const created = this.connection.prepare(`SELECT id FROM events WHERE project_id = ?
+        AND entity_id = ? AND event_type = 'agent.run_created' ORDER BY id DESC LIMIT 1`)
+        .get(task.project_id, implementation.id) as { id: number } | undefined;
+      if (!created || created.id <= requeued.id) throw new Error("A rerun requires new implementation or report evidence");
+    }
+    if (!completing || !release) return evidence;
+    const application = this.connection.prepare(`SELECT a.* FROM integration_applications a
+      JOIN task_integration_proposals p ON p.approval_id = a.approval_id
+      JOIN approval_requests approval ON approval.id = p.approval_id
+      WHERE p.project_id = ? AND p.task_id = ? AND p.change_run_id = ? AND p.release_run_id = ?
+        AND p.status = 'applied' AND approval.status = 'approved' AND a.status = 'applied'
+        AND p.superseded_at IS NULL AND approval.superseded_at IS NULL LIMIT 1`)
+      .get(task.project_id, task.id, implementation.id, release.id) as IntegrationApplicationRow | undefined;
+    if (!application?.result_json) throw new Error("Task completion requires approved, applied integration of the current implementation");
+    const request = JSON.parse(application.request_json) as ApplyCodingRunRequest;
+    const result = JSON.parse(application.result_json) as ApplyCodingRunResponse;
+    if (request.runId !== implementation.id || request.taskId !== task.id || request.approvalId !== application.approval_id ||
+        request.repositories.length !== implementation.result.commits.length ||
+        result.applied.length !== request.repositories.length ||
+        new Set(result.applied.map(item => item.repositoryId)).size !== result.applied.length ||
+        implementation.result.commits.some(commit => !request.repositories.some(repo => repo.repositoryId === commit.repositoryId && repo.sha === commit.sha)) ||
+        request.repositories.some(repo => !result.applied.some(item => item.repositoryId === repo.repositoryId &&
+          item.sha === repo.sha && item.branch === repo.branch && item.targetBranch === repo.targetBranch))) {
+      throw new Error("Applied integration evidence must match the current implementation's complete commit set");
+    }
+    return evidence;
   }
 
   listTaskWorkflowRecoveries(projectId: string): TaskWorkflowRecoverySummary[] {
@@ -1502,6 +1741,7 @@ export class TeamDatabase {
         .prepare("SELECT * FROM approval_requests WHERE id = ? AND project_id = ?")
         .get(approvalId, projectId) as ApprovalRow | undefined;
       if (!row) throw new Error("Approval request not found");
+      if (row.superseded_at) throw new Error("Approval request has been superseded");
       if (row.status !== "pending") throw new Error("Approval request has already been decided");
 
       this.connection
@@ -1611,9 +1851,11 @@ export class TeamDatabase {
         completed: [],
         cancelled: [],
       };
+      this.assertNoUnfinishedIntegration(taskId);
       if (!validTransitions[task.status].includes(nextStatus)) {
         throw new Error(`Task cannot move from ${task.status} to ${nextStatus}`);
       }
+      if (nextStatus === "review" || nextStatus === "completed") this.assertTaskCanAdvance(task, nextStatus === "completed");
 
       this.connection
         .prepare("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?")
@@ -1666,6 +1908,7 @@ export class TeamDatabase {
   requeueTask(projectId: string, taskId: string): TaskSummary {
     const now = new Date().toISOString();
     this.connection.transaction(() => {
+      this.assertNoUnfinishedIntegration(taskId);
       const task = this.connection
         .prepare("SELECT * FROM tasks WHERE id = ? AND project_id = ?")
         .get(taskId, projectId) as TaskRow | undefined;
@@ -1673,6 +1916,12 @@ export class TeamDatabase {
       if (!["review", "completed"].includes(task.status)) {
         throw new Error(`Task cannot be re-run while it is ${task.status}`);
       }
+      const active = this.connection.prepare(`SELECT 1 FROM agent_runs WHERE project_id = ? AND task_id = ?
+        AND status IN ('queued', 'provisioning', 'running', 'waiting') LIMIT 1`).get(projectId, taskId);
+      if (active) throw new Error("Task cannot be re-run while an agent run is active");
+      const priorProposal = this.listIntegrationProposals(projectId).find(proposal => proposal.taskId === taskId && proposal.status !== "superseded");
+      const rejectedApproval = priorProposal?.status === "rejected" ? this.getApproval(projectId, priorProposal.approvalId) : null;
+      this.supersedeTaskIntegrationProposals(projectId, taskId, "Task requeued for new work", now);
       const incompleteDependency = this.connection
         .prepare(
           `SELECT 1
@@ -1694,6 +1943,8 @@ export class TeamDatabase {
       this.recordEvent(projectId, "task.requeued", "task", taskId, {
         from: task.status,
         to: nextStatus,
+        rejectedChangeRunId: rejectedApproval ? priorProposal!.changeRunId : null,
+        directorFeedback: rejectedApproval?.decisionNote ?? null,
       }, now);
     })();
     const task = this.getOrchestrationState(projectId)?.tasks.find((candidate) => candidate.id === taskId);
@@ -1729,6 +1980,113 @@ export class TeamDatabase {
       body: record.body,
       createdAt: now,
     };
+  }
+
+  getAgentQuestionRequest(projectId: string, requestId: string): (AgentQuestionResponse & { source: "voice" | "text" }) | null {
+    const row = this.connection.prepare("SELECT * FROM agent_question_requests WHERE project_id = ? AND request_id = ?")
+      .get(projectId, requestId) as { message_id: string; run_id: string; source: "voice" | "text" } | undefined;
+    if (!row) return null;
+    const message = this.connection.prepare("SELECT * FROM agent_messages WHERE id = ?").get(row.message_id) as AgentMessageRow;
+    const run = this.getAgentRun(row.run_id);
+    if (!run) throw new Error("Question run not found");
+    return { message: mapAgentMessageRow(message), run, source: row.source, duplicate: true };
+  }
+
+  createAgentQuestion(record: {
+    requestId: string; source: "voice" | "text"; body: string; messageId: string;
+    brainProfileId: string; spec: RunSpec; attemptId: string;
+  }): AgentQuestionResponse {
+    return this.connection.transaction(() => {
+      const existing = this.getAgentQuestionRequest(record.spec.projectId, record.requestId);
+      if (existing) {
+        if (existing.message.agentRole !== record.spec.agentRole || existing.message.body !== record.body || existing.source !== record.source) {
+          throw new Error("This request ID was already used for a different question.");
+        }
+        return existing;
+      }
+      const active = this.connection.prepare(`SELECT 1 FROM agent_question_requests q JOIN agent_runs r ON r.id = q.run_id
+        WHERE q.project_id = ? AND q.agent_role = ? AND r.status IN ('queued', 'provisioning', 'running', 'waiting') LIMIT 1`)
+        .get(record.spec.projectId, record.spec.agentRole);
+      if (active) throw new Error("This agent is already answering a question. Please wait for its answer.");
+      if (record.spec.taskId || record.spec.permissions.filesystem !== "read-only" || record.spec.runPurpose !== "consultation") {
+        throw new Error("Questions require a separate read-only consultation run.");
+      }
+      const message = this.createAgentMessage({ id: record.messageId, projectId: record.spec.projectId, agentRole: record.spec.agentRole, author: "director", body: record.body });
+      const run = this.createAgentRun(record.brainProfileId, record.spec);
+      this.createRunAttempt({ id: record.attemptId, runId: run.id, attemptNumber: 1 });
+      this.connection.prepare(`INSERT INTO agent_question_requests(project_id, request_id, agent_role, source, message_id, run_id)
+        VALUES (?, ?, ?, ?, ?, ?)`).run(record.spec.projectId, record.requestId, record.spec.agentRole, record.source, message.id, run.id);
+      return { message, run, duplicate: false };
+    })();
+  }
+
+  getVoiceCommand(projectId: string, requestId: string): VoiceCommandReceipt | null {
+    const row = this.connection.prepare("SELECT * FROM voice_commands WHERE project_id = ? AND request_id = ?")
+      .get(projectId, requestId) as { input_json: string; preview_json: string; status: VoiceCommandReceipt["status"]; message: string; run_id: string | null; created_at: string; updated_at: string } | undefined;
+    return row ? { projectId, input: JSON.parse(row.input_json), preview: JSON.parse(row.preview_json), status: row.status,
+      message: row.message, runId: row.run_id, createdAt: row.created_at, updatedAt: row.updated_at } : null;
+  }
+
+  prepareVoiceCommand(projectId: string, input: VoiceCommandInput, preview: VoiceCommandPreview): VoiceCommandReceipt {
+    return this.connection.transaction(() => {
+      const existing = this.getVoiceCommand(projectId, input.requestId);
+      if (existing) {
+        if (JSON.stringify(existing.input) !== JSON.stringify(input)) throw new Error("This request ID already refers to a different voice action.");
+        return existing;
+      }
+      const now = new Date().toISOString();
+      this.connection.prepare(`INSERT INTO voice_commands(project_id, request_id, input_json, preview_json, status, message, run_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'prepared', ?, NULL, ?, ?)`)
+        .run(projectId, input.requestId, JSON.stringify(input), JSON.stringify(preview), "Review this action before applying it.", now, now);
+      return this.getVoiceCommand(projectId, input.requestId)!;
+    })();
+  }
+
+  claimVoiceCommand(projectId: string, requestId: string): boolean {
+    return this.connection.prepare(`UPDATE voice_commands SET status = 'dispatching', message = 'Applying the reviewed action…', updated_at = ?
+      WHERE project_id = ? AND request_id = ? AND status = 'prepared'`).run(new Date().toISOString(), projectId, requestId).changes === 1;
+  }
+
+  finishVoiceCommand(projectId: string, requestId: string, status: "applied" | "failed", message: string, runId: string | null = null): VoiceCommandReceipt {
+    this.connection.prepare(`UPDATE voice_commands SET status = ?, message = ?, run_id = ?, updated_at = ?
+      WHERE project_id = ? AND request_id = ? AND status = 'dispatching'`).run(status, message, runId, new Date().toISOString(), projectId, requestId);
+    return this.getVoiceCommand(projectId, requestId)!;
+  }
+
+  reconcileInterruptedVoiceCommands(): number {
+    return this.connection.prepare(`UPDATE voice_commands SET status = 'interrupted', updated_at = ?, message = ? WHERE status = 'dispatching'`)
+      .run(new Date().toISOString(), "The app restarted while this action was being dispatched. It will not be replayed. Check the agent conversation and task recovery before submitting another request.").changes;
+  }
+
+  applyVoiceDirectiveCommand(projectId: string, requestId: string): VoiceCommandReceipt {
+    return this.connection.transaction(() => {
+      const command = this.getVoiceCommand(projectId, requestId);
+      if (!command || command.status !== "dispatching") throw new Error("Voice action is not being dispatched");
+      const { input, preview } = command;
+      if (input.action !== "directive_add" && input.action !== "directive_remove") throw new Error("Expected a standing instruction action");
+      const state = this.getOrchestrationState(projectId)!;
+      const roles = input.recipient === "team" ? [...agentRoles] : [input.recipient];
+      if (input.action === "directive_remove") {
+        if (!preview.directives.length || preview.directives.some(selected => !roles.includes(selected.role) || !state.directives.some(current => current.id === selected.id && current.agentRole === selected.role && current.content === selected.content))) {
+          throw new Error("The saved instructions changed since review. Review a fresh request before removing them.");
+        }
+      } else if (roles.some(role => state.directives.filter(directive => directive.agentRole === role).length >= 100)) {
+        throw new Error("An agent already has 100 standing instructions. Remove an older instruction first.");
+      }
+      const affected = input.action === "directive_remove" ? [...new Set(preview.directives.map(directive => directive.role))] : roles;
+      for (const role of affected) {
+        const message = this.createAgentMessage({ id: randomUUID(), projectId, agentRole: role, author: "director", body: `${input.action === "directive_add" ? "Standing instruction" : "Remove standing instruction"}${input.recipient === "team" ? " for the team" : ""}: ${input.body}` });
+        if (input.action === "directive_add") this.createAgentDirective({ id: randomUUID(), projectId, agentRole: role, content: input.body, sourceMessageId: message.id });
+        else for (const directive of preview.directives.filter(directive => directive.role === role)) this.removeAgentDirective(projectId, role, directive.id);
+        this.createAgentMessage({ id: randomUUID(), projectId, agentRole: role, author: "system", body: input.action === "directive_add" ? "Standing instruction saved. It applies to future turns and task stages; running workers keep their current instructions." : "Standing instruction removed from future turns and task stages." });
+      }
+      return this.finishVoiceCommand(projectId, requestId, "applied", `${input.action === "directive_add" ? "Saved" : "Removed"} the standing instruction for ${affected.length} agent${affected.length === 1 ? "" : "s"}. Running work was not interrupted.`);
+    })();
+  }
+
+  getAgentStandingDirectives(projectId: string, agentRole: AgentRole): string[] {
+    return (this.connection.prepare("SELECT content FROM agent_directives WHERE project_id = ? AND agent_role = ? AND status = 'active' ORDER BY created_at, rowid")
+      .all(projectId, agentRole) as Array<{ content: string }>).map(row => row.content);
   }
 
   createAgentDirective(record: {
@@ -1946,6 +2304,7 @@ export class TeamDatabase {
 
     const now = new Date().toISOString();
     const create = this.connection.transaction(() => {
+      if (spec.taskId) this.assertNoUnfinishedIntegration(spec.taskId);
       this.connection
         .prepare(
           `INSERT INTO agent_runs
@@ -1967,6 +2326,9 @@ export class TeamDatabase {
         agentRole: spec.agentRole,
         taskId: spec.taskId ?? null,
       }, now);
+      if (spec.taskId && ["implementation", "repair", "release"].includes(spec.runPurpose ?? "implementation")) {
+        this.supersedeTaskIntegrationProposals(spec.projectId, spec.taskId, `New ${spec.runPurpose ?? "implementation"} run started`, now);
+      }
     });
     create();
     const run = this.getAgentRun(spec.runId);
@@ -2001,15 +2363,38 @@ export class TeamDatabase {
   listAgentRuns(projectId: string, limit = 25): AgentRunSummary[] {
     return (
       this.connection
-        .prepare("SELECT * FROM agent_runs WHERE project_id = ? ORDER BY created_at DESC LIMIT ?")
+        .prepare("SELECT * FROM agent_runs WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?")
         .all(projectId, limit) as AgentRunRow[]
     ).map(mapAgentRunRow);
+  }
+
+  listActiveAgentRuns(projectId: string, filter: { taskId?: string; agentRole?: AgentRole } = {}): AgentRunSummary[] {
+    return (this.connection.prepare(`SELECT * FROM agent_runs WHERE project_id = ?
+      AND status IN ('queued', 'provisioning', 'running', 'waiting')
+      AND (? IS NULL OR task_id = ?) AND (? IS NULL OR agent_role = ?)
+      ORDER BY created_at DESC, rowid DESC`)
+      .all(projectId, filter.taskId ?? null, filter.taskId ?? null, filter.agentRole ?? null, filter.agentRole ?? null) as AgentRunRow[])
+      .map(mapAgentRunRow);
+  }
+
+  private listTaskCardRuns(projectId: string, taskId: string, activeRuns: AgentRunSummary[]): AgentRunSummary[] {
+    const { runs } = this.getTaskWorkflowContext(projectId, taskId);
+    const implementation = runs.find(run => ["implementation", "repair"].includes(run.spec.runPurpose ?? "implementation"));
+    const selectedIds = new Set([runs[0]?.id, implementation?.id]);
+    for (const check of ["qa", "code_review", "security"]) {
+      const verification = runs.find(run => run.spec.runPurpose === "verification" && run.spec.verificationCheck === check &&
+        run.spec.upstreamArtifacts.includes(`implementation-run:${implementation?.id}`));
+      if (verification) selectedIds.add(verification.id);
+    }
+    const active = activeRuns.filter(run => run.taskId === taskId);
+    for (const run of active) selectedIds.add(run.id);
+    return [...new Map([...runs.filter(run => selectedIds.has(run.id)), ...active].map(run => [run.id, run])).values()];
   }
 
   listAgentRunsForTask(projectId: string, taskId: string): AgentRunSummary[] {
     return (
       this.connection
-        .prepare("SELECT * FROM agent_runs WHERE project_id = ? AND task_id = ? ORDER BY created_at DESC")
+        .prepare("SELECT * FROM agent_runs WHERE project_id = ? AND task_id = ? ORDER BY created_at DESC, rowid DESC")
         .all(projectId, taskId) as AgentRunRow[]
     ).map(mapAgentRunRow);
   }
@@ -2330,6 +2715,53 @@ export class TeamDatabase {
     return { ...record, createdAt: now };
   }
 
+  // Taskless runs have no lease. Reconcile them only when their owning API
+  // process has restarted, never during the periodic task-lease sweep.
+  reconcileInterruptedAgentRuns(now: string): AgentRunSummary[] {
+    return this.connection.transaction(() => {
+      const rows = this.connection.prepare(`SELECT * FROM agent_runs WHERE task_id IS NULL
+        AND status IN ('queued', 'provisioning', 'running', 'waiting') ORDER BY created_at, rowid`).all() as AgentRunRow[];
+      const reason = "The application restarted before this agent turn completed. Conversation history was preserved; send a new message to continue.";
+      for (const row of rows) {
+        this.markRunInterrupted(row, now, reason, { recoverable: false, continueWithNewMessage: true });
+        this.connection.prepare(`INSERT INTO agent_messages (id, project_id, agent_role, author, body, created_at)
+          VALUES (?, ?, ?, 'system', ?, ?)`)
+          .run(randomUUID(), row.project_id, row.agent_role, reason, now);
+        this.recordEvent(row.project_id, "agent.run_interrupted", "agent_run", row.id, { agentRole: row.agent_role, reason }, now);
+      }
+      return rows.map(row => this.getAgentRun(row.id)!);
+    })();
+  }
+
+  listPendingWorkerCleanups(): string[] {
+    return (this.connection.prepare("SELECT run_id FROM interrupted_worker_cleanups ORDER BY requested_at, rowid")
+      .all() as Array<{ run_id: string }>).map(row => row.run_id);
+  }
+
+  completeWorkerCleanup(runId: string): void {
+    this.connection.prepare("DELETE FROM interrupted_worker_cleanups WHERE run_id = ?").run(runId);
+  }
+
+  private queueWorkerCleanup(runId: string, now: string): void {
+    this.connection.prepare("INSERT OR IGNORE INTO interrupted_worker_cleanups (run_id, requested_at) VALUES (?, ?)").run(runId, now);
+  }
+
+  private markRunInterrupted(row: AgentRunRow, now: string, reason: string, payload: Record<string, unknown>): void {
+    this.connection.prepare(`UPDATE run_attempts
+      SET status = 'timed_out', failure_code = 'workflow_interrupted', failure_message = ?, completed_at = ?
+      WHERE run_id = ? AND status IN ('provisioning', 'running')`).run(reason, now, row.id);
+    // Preserve result_json, provider threads, and completed attempts as history.
+    this.connection.prepare("UPDATE agent_runs SET status = 'timed_out', updated_at = ?, completed_at = ? WHERE id = ?")
+      .run(now, now, row.id);
+    const sequence = (this.connection.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM agent_run_events WHERE run_id = ?")
+      .get(row.id) as { sequence: number }).sequence + 1;
+    this.connection.prepare(`INSERT INTO agent_run_events
+      (id, run_id, attempt_id, sequence, event_type, message, payload_json, created_at)
+      VALUES (?, ?, NULL, ?, 'run.timed_out', ?, ?, ?)`)
+      .run(randomUUID(), row.id, sequence, reason, JSON.stringify(payload), now);
+    this.queueWorkerCleanup(row.id, now);
+  }
+
   reconcileInterruptedTaskRuns(now: string, includeUnexpired = false): TaskWorkflowRecoverySummary[] {
     const activeRows = this.connection.prepare(
       `SELECT ar.*, tl.expires_at AS lease_expires_at
@@ -2339,13 +2771,12 @@ export class TeamDatabase {
        WHERE task.status = 'in_progress'
          AND ar.status IN ('queued', 'provisioning', 'running', 'waiting')
          AND (? = 1 OR tl.expires_at IS NULL OR tl.expires_at <= ?)
-       ORDER BY ar.created_at DESC`,
+       ORDER BY ar.created_at DESC, ar.rowid DESC`,
     ).all(includeUnexpired ? 1 : 0, now) as Array<AgentRunRow & { lease_expires_at: string | null }>;
     const affectedTaskIds = new Set<string>();
     const reconcile = this.connection.transaction(() => {
       for (const row of activeRows) {
-        if (!row.task_id || affectedTaskIds.has(row.task_id)) continue;
-        affectedTaskIds.add(row.task_id);
+        if (!row.task_id) continue;
         const spec = JSON.parse(row.run_spec_json) as RunSpec;
         const stage: TaskWorkflowRecoveryStage = spec.runPurpose === "verification"
           ? "verification"
@@ -2357,22 +2788,11 @@ export class TeamDatabase {
         const reason = includeUnexpired
           ? "The application restarted before this agent run reported completion."
           : "The agent run stopped reporting and its task lease expired.";
-        this.connection.prepare(
-          `UPDATE run_attempts
-           SET status = 'timed_out', failure_code = 'workflow_interrupted', failure_message = ?, completed_at = ?
-           WHERE run_id = ? AND status IN ('provisioning', 'running')`,
-        ).run(reason, now, row.id);
-        this.connection.prepare(
-          `UPDATE agent_runs SET status = 'timed_out', updated_at = ?, completed_at = ? WHERE id = ?`,
-        ).run(now, now, row.id);
-        const sequence = (this.connection.prepare(
-          "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM agent_run_events WHERE run_id = ?",
-        ).get(row.id) as { sequence: number }).sequence + 1;
-        this.connection.prepare(
-          `INSERT INTO agent_run_events
-            (id, run_id, attempt_id, sequence, event_type, message, payload_json, created_at)
-           VALUES (?, ?, NULL, ?, 'run.timed_out', ?, ?, ?)`,
-        ).run(randomUUID(), row.id, sequence, reason, JSON.stringify({ recoverable: true, stage }), now);
+        this.markRunInterrupted(row, now, reason, { recoverable: true, stage });
+        // Every interrupted worker needs stopping, but the task resumes from
+        // its most recent stage and receives only one recovery notice.
+        if (affectedTaskIds.has(row.task_id)) continue;
+        affectedTaskIds.add(row.task_id);
         this.connection.prepare(
           `INSERT INTO task_workflow_recoveries
             (task_id, project_id, interrupted_run_id, stage, verification_check, reason, interrupted_at)
@@ -2427,6 +2847,7 @@ export class TeamDatabase {
              verification_check = excluded.verification_check, reason = excluded.reason, interrupted_at = excluded.interrupted_at`,
         ).run(lease.task_id, lease.project_id, latest.id, stage, spec.verificationCheck ?? null, reason, now);
         this.connection.prepare("DELETE FROM task_leases WHERE task_id = ?").run(lease.task_id);
+        this.queueWorkerCleanup(latest.id, now);
         this.recordEvent(lease.project_id, "task.workflow_interrupted", "task", lease.task_id, { runId: latest.id, stage, reason }, now);
       }
     });
@@ -2553,20 +2974,33 @@ function mapProjectSettingsRow(row: ProjectSettingsRow): ProjectSettingsSummary 
 }
 
 function mapModelBackendRow(row: ModelBackendRow): ModelBackendSummary {
+  const configuration = JSON.parse(row.configuration_json || "{}") as ModelBackendSummary["configuration"];
+  const bedrock = configuration.bedrockEndpoint === "runtime" || configuration.bedrockEndpoint === "mantle";
   return {
     id: row.id,
     projectId: row.project_id,
     name: row.name,
-    provider: row.provider,
+    provider: bedrock ? "aws-bedrock" : row.provider,
     protocol: row.protocol,
     model: row.model,
     baseUrl: row.base_url,
-    authMode: row.auth_mode,
+    authMode: bedrock ? "aws-profile" : row.auth_mode,
     credentialRef: row.credential_ref,
+    configuration,
     enabled: row.enabled === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function storedModelBackendProvider(provider: ModelBackendSummary["provider"]): Exclude<ModelBackendSummary["provider"], "aws-bedrock"> {
+  // Older databases enforce the original provider/auth enums with CHECK constraints.
+  // Keep those rows compatible and use the Bedrock configuration discriminator at the API boundary.
+  return provider === "aws-bedrock" ? "openai" : provider;
+}
+
+function storedModelBackendAuthMode(authMode: ModelBackendSummary["authMode"]): Exclude<ModelBackendSummary["authMode"], "aws-profile"> {
+  return authMode === "aws-profile" ? "none" : authMode;
 }
 
 function mapCodingHarnessRow(row: CodingHarnessRow): CodingHarnessSummary {
@@ -2660,7 +3094,8 @@ function mapApprovalRow(row: ApprovalRow): ApprovalSummary {
     type: row.approval_type,
     title: row.title,
     details: row.details,
-    status: row.status,
+    status: row.superseded_at ? "superseded" : row.status,
+    supersededAt: row.superseded_at,
     requestedByRole: row.requested_by_role,
     requestedAt: row.requested_at,
     decidedAt: row.decided_at,
@@ -2830,10 +3265,16 @@ function mapIntegrationProposalRow(row: IntegrationProposalRow): IntegrationProp
     taskId: row.task_id,
     changeRunId: row.change_run_id,
     releaseRunId: row.release_run_id,
-    status: row.status,
+    status: row.superseded_at ? "superseded" : row.status,
+    supersededAt: row.superseded_at,
     createdAt: row.created_at,
     decidedAt: row.decided_at,
     appliedAt: row.applied_at,
+    application: row.application_status ? {
+      status: row.application_status,
+      leaseExpiresAt: row.application_lease_expires_at ?? null,
+      lastError: row.application_last_error ?? null,
+    } : null,
   };
 }
 

@@ -17,6 +17,7 @@ services:
       ENGINEERING_TEAM_PROJECT_NAME: ${ENGINEERING_TEAM_PROJECT_NAME:-}
       ENGINEERING_TEAM_WEB_ROOT: public
       ENGINEERING_TEAM_CONTROLLER_URL: http://controller:4319
+      ENGINEERING_TEAM_SPEECH_URL: http://speech:4320
       ENGINEERING_TEAM_UID: ${ENGINEERING_TEAM_UID:-1000}
       ENGINEERING_TEAM_GID: ${ENGINEERING_TEAM_GID:-1000}
     volumes:
@@ -38,6 +39,42 @@ services:
     depends_on:
       controller:
         condition: service_healthy
+    networks:
+      - default
+      - speech
+
+  speech-models:
+    profiles: ["voice"]
+    build:
+      context: .
+      dockerfile: docker/voice.Dockerfile
+    image: local/engineering-team-speech:v1
+    user: "0:0"
+    entrypoint: ["/usr/local/bin/download-speech-model"]
+    volumes:
+      - engineering-team-speech-models:/models
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  speech:
+    profiles: ["voice"]
+    image: local/engineering-team-speech:v1
+    restart: unless-stopped
+    depends_on:
+      speech-models:
+        condition: service_completed_successfully
+    volumes:
+      - engineering-team-speech-models:/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 2g
+    cpus: 4
+    networks: [speech]
 
   controller:
     build:
@@ -55,11 +92,13 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       CODEX_API_KEY: ${CODEX_API_KEY:-}
       CODEX_ACCESS_TOKEN: ${CODEX_ACCESS_TOKEN:-}
+      AWS_EC2_METADATA_DISABLED: "true"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - engineering-team-worktrees:/worktrees
       - ${WORKSPACE_ROOT:-..}:/workspaces:rw
       - ${CODEX_AUTH_FILE:-/dev/null}:/run/secrets/codex-auth.json:ro
+      - ${AWS_CONFIG_DIR:-./docker/empty-aws}:/root/.aws:ro
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
@@ -76,3 +115,8 @@ services:
 volumes:
   engineering-team-data:
   engineering-team-worktrees:
+  engineering-team-speech-models:
+
+networks:
+  speech:
+    internal: true

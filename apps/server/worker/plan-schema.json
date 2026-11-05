@@ -79,6 +79,7 @@
           },
           "acceptanceCriteria": {
             "type": "array",
+            "description": "Distinct acceptance criteria; each criterion must have unique, nonempty text.",
             "minItems": 1,
             "maxItems": 20,
             "items": { "type": "string", "minLength": 1, "maxLength": 500 }

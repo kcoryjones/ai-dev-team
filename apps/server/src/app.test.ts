@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import { TeamDatabase } from "@engineering-team/database";
 import { createApp } from "./app.js";
 import { createRepository as createGitRepository } from "./repository.js";
+import { appendCompletedHistory } from "./test-history.js";
 
 describe("local API", () => {
   it("reports its health and database state", async () => {
@@ -172,8 +173,73 @@ describe("local API", () => {
     });
     assert.equal(chatGptResponse.status, 201);
 
+    const bedrockResponse = await app.request(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "Bedrock Codex",
+        provider: "aws-bedrock",
+        protocol: "openai-responses",
+        model: "us.openai.example",
+        authMode: "aws-profile",
+        configuration: { awsProfile: "codex-bedrock", awsRegion: "us-east-2", bedrockEndpoint: "runtime" },
+      }),
+    });
+    assert.equal(bedrockResponse.status, 201);
+    const bedrock = (await bedrockResponse.json()) as { backend: { provider: string; authMode: string; configuration: { awsProfile: string } } };
+    assert.equal(bedrock.backend.provider, "aws-bedrock");
+    assert.equal(bedrock.backend.authMode, "aws-profile");
+    assert.equal(bedrock.backend.configuration.awsProfile, "codex-bedrock");
+
+    const invalidBedrockResponse = await app.request(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Broken Bedrock", provider: "aws-bedrock", protocol: "openai-responses", authMode: "aws-profile" }),
+    });
+    assert.equal(invalidBedrockResponse.status, 400);
+
     const deleteResponse = await app.request(`${endpoint}/${created.backend.id}`, { method: "DELETE" });
     assert.equal(deleteResponse.status, 204);
+
+    database.close();
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it("preflights Bedrock profiles and discovers compatible models through the controller", async () => {
+    const database = new TeamDatabase(":memory:");
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-api-"));
+    const app = createApp(database, {
+      workspaceRoot,
+      workspaceName: "Customer Platform",
+      harnessInspector: {
+        async getCapabilities() { return { workerImage: "test", imageDigest: null, harnesses: [] }; },
+        async preflightModelBackend(backend) {
+          assert.equal(backend.provider, "aws-bedrock");
+          assert.equal(backend.configuration.awsProfile, "codex-bedrock");
+          return { backendId: backend.id, state: "ready", message: "AWS profile is ready" };
+        },
+        async discoverModelBackendModels(backend) {
+          return { backendId: backend.id, models: [{ id: "us.openai.example", name: "Example", source: "inference-profile" }] };
+        },
+      },
+    });
+    const project = (await (await app.request("/api/projects/workspace", { method: "POST" })).json()) as { project: { id: string } };
+    const endpoint = `/api/projects/${project.project.id}/model-backends`;
+    const created = (await (await app.request(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "Bedrock Codex", provider: "aws-bedrock", protocol: "openai-responses", authMode: "aws-profile",
+        configuration: { awsProfile: "codex-bedrock", awsRegion: "us-east-2", bedrockEndpoint: "runtime" },
+      }),
+    })).json()) as { backend: { id: string } };
+
+    const preflight = await app.request(`${endpoint}/${created.backend.id}/preflight`, { method: "POST" });
+    assert.equal(preflight.status, 200);
+    assert.equal(((await preflight.json()) as { preflight: { state: string } }).preflight.state, "ready");
+    const models = await app.request(`${endpoint}/${created.backend.id}/models`, { method: "POST" });
+    assert.equal(models.status, 200);
+    assert.deepEqual(((await models.json()) as { models: Array<{ id: string }> }).models.map((model) => model.id), ["us.openai.example"]);
 
     database.close();
     rmSync(workspaceRoot, { recursive: true, force: true });
@@ -883,7 +949,7 @@ describe("local API", () => {
           body: JSON.stringify({ status }),
         },
       );
-      assert.equal(transitionResponse.status, 200);
+      assert.equal(transitionResponse.status, status === "in_progress" ? 200 : 409);
     }
     const releasedStateResponse = await app.request(
       "/api/projects/project-1/orchestration",
@@ -893,7 +959,7 @@ describe("local API", () => {
     };
     assert.deepEqual(
       releasedStateBody.state.tasks.map((task) => task.status),
-      ["completed", "ready"],
+      ["in_progress", "blocked"],
     );
 
     const invalidPlanResponse = await app.request("/api/projects/project-1/plans", {
@@ -1546,6 +1612,9 @@ describe("local API", () => {
         async applyTask() { throw new Error("Not used"); },
       },
     });
+    appendCompletedHistory(database, database.getAgentRun(qaSpec.runId)!);
+    assert(!database.listAgentRuns(projectId).some(run => run.id === qaSpec.runId));
+    assert(database.getOrchestrationState(projectId)?.taskRuns["task-resume"]?.some(run => run.id === qaSpec.runId));
     const resumeResponse = await app.request(`/api/projects/${projectId}/tasks/task-resume/resume`, { method: "POST" });
     assert.equal(resumeResponse.status, 202, JSON.stringify(await resumeResponse.clone().json()));
     await new Promise((resolvePromise) => setImmediate(resolvePromise));
@@ -1554,6 +1623,7 @@ describe("local API", () => {
     assert.equal(state?.tasks[0]?.status, "review");
     assert.equal(state?.integrationProposals[0]?.status, "pending");
     assert.equal(state?.recoveries.length, 0);
+    assert(state?.taskRuns["task-resume"]?.some(run => run.id === qaSpec.runId));
     assert.equal(database.getAgentRun(reviewSpec.runId)?.status, "timed_out");
     assert.equal(database.listRunEvents(reviewSpec.runId).at(-1)?.type, "run.timed_out");
 
@@ -1561,95 +1631,110 @@ describe("local API", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  it("completes reviewer tasks with evidence and no code commit", async () => {
-    const database = new TeamDatabase(":memory:");
-    const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-api-"));
-    const projectId = "33333333-3333-4333-8333-333333333333";
-    const repositoryId = "44444444-4444-4444-8444-444444444444";
-    createGitRepository(workspaceRoot, "backend");
-    database.createProject({
-      id: projectId,
-      name: "Builder",
-      repository: { id: repositoryId, name: "backend", relativePath: "backend", defaultBranch: "main" },
-    });
-    database.createCodingHarness(projectId, "harness-review", {
-      name: "Codex",
-      adapter: "codex",
-      executable: "codex",
-      supportedProtocols: ["openai-responses"],
-      capabilities: ["coding", "review", "testing"],
-    });
-    database.createModelBackend(projectId, "backend-review", {
-      name: "ChatGPT",
-      provider: "openai",
-      protocol: "openai-responses",
-      model: "gpt-test",
-      authMode: "chatgpt",
-    });
-    database.assignAgentRuntime(projectId, "code_reviewer", "harness-review", "backend-review");
-    const app = createApp(database, {
-      workspaceRoot,
-      taskExecutor: {
-        async executeTask(request) {
-          assert.equal(request.run.agentRole, "code_reviewer");
-          return {
-            workerId: `engineering-team-task-${request.run.runId}`,
-            imageDigest: "sha256:test",
-            providerThreadId: "thread-review",
-            branches: [],
-            result: {
-              schemaVersion: 1,
-              status: "completed",
-              summary: "Reviewed the implementation; no changes required.",
-              changedFiles: [],
-              commits: [],
-              checks: [{ command: "npm test", status: "passed" }],
-              acceptanceCriteria: [{ criterion: "Implementation is verified", satisfied: true, evidence: "Tests pass" }],
-              questions: [],
-              risks: [],
-              artifacts: [],
-            },
-          };
+  for (const checkOutcome of ["not_required", "passed", "failed", "invalid_evidence"] as const) {
+    it(`completes report tasks only with valid evidence and required checks (${checkOutcome})`, async () => {
+      const requiresQa = checkOutcome === "passed" || checkOutcome === "failed";
+      const completes = checkOutcome === "not_required" || checkOutcome === "passed";
+      const database = new TeamDatabase(":memory:");
+      const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-api-"));
+      const projectId = "33333333-3333-4333-8333-333333333333";
+      const repositoryId = "44444444-4444-4444-8444-444444444444";
+      createGitRepository(workspaceRoot, "backend");
+      database.createProject({
+        id: projectId,
+        name: "Builder",
+        repository: { id: repositoryId, name: "backend", relativePath: "backend", defaultBranch: "main" },
+      });
+      database.createCodingHarness(projectId, "harness-review", {
+        name: "Codex",
+        adapter: "codex",
+        executable: "codex",
+        supportedProtocols: ["openai-responses"],
+        capabilities: ["coding", "review", "testing"],
+      });
+      database.createModelBackend(projectId, "backend-review", {
+        name: "ChatGPT",
+        provider: "openai",
+        protocol: "openai-responses",
+        model: "gpt-test",
+        authMode: "chatgpt",
+      });
+      database.assignAgentRuntime(projectId, "code_reviewer", "harness-review", "backend-review");
+      database.updateProjectSettings(projectId, { defaultRunRetries: 0 });
+      database.assignAgentRuntime(projectId, "qa_engineer", "harness-review", "backend-review");
+      const purposes: string[] = [];
+      const app = createApp(database, {
+        workspaceRoot,
+        taskExecutor: {
+          async executeTask(request) {
+            purposes.push(request.run.runPurpose ?? "implementation");
+            assert.equal(request.run.agentRole, request.run.runPurpose === "verification" ? "qa_engineer" : "code_reviewer");
+            const failed = checkOutcome === "failed" && request.run.runPurpose === "verification";
+            return {
+              workerId: `engineering-team-task-${request.run.runId}`,
+              imageDigest: "sha256:test",
+              providerThreadId: "thread-review",
+              branches: [],
+              result: {
+                schemaVersion: 1,
+                status: failed ? "failed" : "completed",
+                summary: "Reviewed the implementation; no changes required.",
+                changedFiles: [],
+                commits: [],
+                checks: [{ command: "npm test", status: failed ? "failed" : "passed" }],
+                acceptanceCriteria: checkOutcome === "invalid_evidence" ? [] : [{ criterion: "Implementation is verified", satisfied: !failed, evidence: failed ? "Regression reproduced" : "Tests pass" }],
+                questions: [],
+                risks: [],
+                artifacts: [],
+              },
+            };
+          },
+          async applyTask() {
+            throw new Error("Evidence-only runs must not be applied");
+          },
         },
-        async applyTask() {
-          throw new Error("Evidence-only runs must not be applied");
-        },
-      },
-    });
-    const planResponse = await app.request(`/api/projects/${projectId}/plans`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        objective: { title: "Review", description: "Verify the backend" },
-        tasks: [{
-          key: "review",
-          title: "Review backend",
-          description: "Run the checks",
-          assignedRole: "code_reviewer",
-          repositoryIds: [repositoryId],
-          acceptanceCriteria: ["Implementation is verified"],
-          requiredChecks: { qa: false, codeReview: false, security: false },
-          dependsOn: [],
-        }],
-      }),
-    });
-    const plan = (await planResponse.json()) as { approval: { id: string }; tasks: Array<{ id: string }> };
-    await app.request(`/api/projects/${projectId}/approvals/${plan.approval.id}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ decision: "approved" }),
-    });
-    const startResponse = await app.request(`/api/projects/${projectId}/tasks/${plan.tasks[0]!.id}/runs`, { method: "POST" });
-    assert.equal(startResponse.status, 202);
-    await new Promise((resolvePromise) => setImmediate(resolvePromise));
-    assert.equal(database.getOrchestrationState(projectId)?.tasks[0]?.status, "completed");
-    const response = await app.request(`/api/projects/${projectId}/orchestration`);
-    const body = await response.json() as { reviews: Array<{ state: string }> };
-    assert.equal(body.reviews[0]?.state, "report-only");
+      });
+      const planResponse = await app.request(`/api/projects/${projectId}/plans`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          objective: { title: "Review", description: "Verify the backend" },
+          tasks: [{
+            key: "review",
+            title: "Review backend",
+            description: "Run the checks",
+            assignedRole: "code_reviewer",
+            repositoryIds: [repositoryId],
+            acceptanceCriteria: ["Implementation is verified"],
+            requiredChecks: { qa: requiresQa, codeReview: false, security: false },
+            dependsOn: [],
+          }],
+        }),
+      });
+      const plan = (await planResponse.json()) as { approval: { id: string }; tasks: Array<{ id: string }> };
+      await app.request(`/api/projects/${projectId}/approvals/${plan.approval.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision: "approved" }),
+      });
+      const startResponse = await app.request(`/api/projects/${projectId}/tasks/${plan.tasks[0]!.id}/runs`, { method: "POST" });
+      assert.equal(startResponse.status, 202);
+      await new Promise((resolvePromise) => setImmediate(resolvePromise));
+      assert.equal(database.getOrchestrationState(projectId)?.tasks[0]?.status, completes ? "completed" : "in_progress");
+      assert.deepEqual(purposes, requiresQa ? ["implementation", "verification"] : ["implementation"]);
+      const report = database.listAgentRunsForTask(projectId, plan.tasks[0]!.id).find(run => run.spec.runPurpose === "implementation")!;
+      appendCompletedHistory(database, report);
+      const response = await app.request(`/api/projects/${projectId}/orchestration`);
+      const body = await response.json() as { reviews: Array<{ state: string }> };
+      assert.equal(body.reviews[0]?.state, completes ? "report-only" : undefined);
 
-    database.close();
-    rmSync(workspaceRoot, { recursive: true, force: true });
-  });
+      if (checkOutcome === "invalid_evidence") {
+        assert(database.getOrchestrationState(projectId)?.messages.some(message => message.body.includes("every acceptance criterion")));
+      }
+      database.close();
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    });
+  }
 
   it("creates and registers a new sibling repository", async () => {
     const database = new TeamDatabase(":memory:");
@@ -1793,6 +1878,45 @@ describe("local API", () => {
     const conversationRun = conversationState?.runs.find((run) => run.agentRole === "architect");
     assert.equal(conversationRun?.status, "completed");
     assert.equal(database.listRunEvents(conversationRun!.id).some((event) => event.type === "repository.inspected"), true);
+
+    database.close();
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  it("propagates Bedrock provider configuration into an agent run", async () => {
+    const database = new TeamDatabase(":memory:");
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-api-"));
+    const project = (await (await createApp(database, { workspaceRoot }).request("/api/projects/workspace", { method: "POST" })).json()) as { project: { id: string } };
+    database.createCodingHarness(project.project.id, "harness-bedrock", {
+      name: "Codex", adapter: "codex", executable: "codex", supportedProtocols: ["openai-responses"], capabilities: ["planning", "coding"],
+    });
+    database.createModelBackend(project.project.id, "backend-bedrock", {
+      name: "Bedrock", provider: "aws-bedrock", protocol: "openai-responses", model: "us.openai.example", authMode: "aws-profile",
+      configuration: { awsProfile: "codex-bedrock", awsRegion: "us-east-2", bedrockEndpoint: "runtime" },
+    });
+    database.assignAgentRuntime(project.project.id, "architect", "harness-bedrock", "backend-bedrock");
+    let observed = false;
+    const app = createApp(database, {
+      workspaceRoot,
+      planningExecutor: {
+        async execute() { throw new Error("Not used"); },
+        async consult(request) {
+          observed = true;
+          assert.equal(request.run.brainProfile.provider, "aws-bedrock");
+          assert.equal(request.run.brainProfile.credentialRef, "AWS_PROFILE");
+          assert.equal(request.run.brainProfile.configuration?.awsProfile, "codex-bedrock");
+          assert.equal(request.run.brainProfile.configuration?.awsRegion, "us-east-2");
+          assert.equal(request.run.brainProfile.configuration?.bedrockEndpoint, "runtime");
+          return { workerId: "worker", imageDigest: "sha256:test", providerThreadId: "thread", response: "Bedrock response", directiveActions: [], contextUpdates: [] };
+        },
+      },
+    });
+    const response = await app.request(`/api/projects/${project.project.id}/agents/architect/messages`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ body: "Check Bedrock." }),
+    });
+    assert.equal(response.status, 202);
+    await new Promise((resolvePromise) => setImmediate(resolvePromise));
+    assert.equal(observed, true);
 
     database.close();
     rmSync(workspaceRoot, { recursive: true, force: true });

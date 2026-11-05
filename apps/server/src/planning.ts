@@ -1,4 +1,4 @@
-import type { ApplyCodingRunRequest, ApplyCodingRunResponse, CodingRunRequest, CodingRunResponse, ConsultationRunRequest, ConsultationRunResponse, PlanningRunRequest, PlanningRunResponse, RunEvent } from "@engineering-team/contracts";
+import type { ApplyCodingRunRequest, ApplyCodingRunResponse, CodingRunRequest, CodingRunResponse, ConsultationRunRequest, ConsultationRunResponse, ModelBackendModelsResponse, ModelBackendPreflightSummary, ModelBackendSummary, PlanningRunRequest, PlanningRunResponse, RunEvent } from "@engineering-team/contracts";
 
 export interface TaskExecutionEvent {
   type: RunEvent["type"];
@@ -31,6 +31,8 @@ export interface WorkerHarnessPreflight {
 export interface HarnessInspector {
   getCapabilities(): Promise<WorkerControllerCapabilities>;
   preflightCodex?(): Promise<WorkerHarnessPreflight>;
+  preflightModelBackend?(backend: ModelBackendSummary): Promise<ModelBackendPreflightSummary>;
+  discoverModelBackendModels?(backend: ModelBackendSummary): Promise<ModelBackendModelsResponse>;
 }
 
 export interface PlanningExecutor {
@@ -263,5 +265,36 @@ export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, Har
       throw new Error(message);
     }
     return body as WorkerHarnessPreflight;
+  }
+
+  async preflightModelBackend(backend: ModelBackendSummary): Promise<ModelBackendPreflightSummary> {
+    return await this.postModelBackendInspection<ModelBackendPreflightSummary>("/model-backends/preflight", backend);
+  }
+
+  async discoverModelBackendModels(backend: ModelBackendSummary): Promise<ModelBackendModelsResponse> {
+    return await this.postModelBackendInspection<ModelBackendModelsResponse>("/model-backends/models", backend);
+  }
+
+  private async postModelBackendInspection<T>(path: string, backend: ModelBackendSummary): Promise<T> {
+    const response = await fetch(new URL(path, this.controllerUrl), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ backend }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const text = await response.text();
+    let body: unknown;
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(`Worker controller returned an invalid model backend response (${response.status})`);
+    }
+    if (!response.ok) {
+      const message = typeof body === "object" && body !== null && "message" in body
+        ? String(body.message)
+        : `Worker controller model backend check failed with status ${response.status}`;
+      throw new Error(message);
+    }
+    return body as T;
   }
 }
