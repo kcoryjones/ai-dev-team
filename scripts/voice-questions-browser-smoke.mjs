@@ -3,40 +3,13 @@
 // Start that fixture with: node scripts/voice-question-fixture.mjs
 // Speech inputs are deterministic stubs; voice-browser-smoke.mjs covers real speech models.
 import assert from "node:assert/strict";
+import { installVoiceInputStubs } from "./voice-input-test-stubs.mjs";
 const { chromium } = await import(process.env.VOICE_PLAYWRIGHT_MODULE || "playwright");
 const url = process.env.VOICE_TEST_URL || "http://127.0.0.1:14318";
 const browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream"] });
 const context = await browser.newContext({ permissions: ["microphone"], viewport: { width: 1280, height: 1000 } });
 await context.route("**/*", route => new URL(route.request().url()).origin === new URL(url).origin ? route.continue() : route.abort());
-await context.addInitScript(() => {
-  window.__tracks = [];
-  const getUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-  navigator.mediaDevices.getUserMedia = async constraints => {
-    const stream = await getUserMedia(constraints); window.__tracks.push(...stream.getTracks()); return stream;
-  };
-  // Keep the actual LocalVoiceSession capture/endpoint/pause state machine, with
-  // deterministic frames and wake results instead of platform audio timing.
-  window.AudioContext = class {
-    state = "running"; destination = {}; audioWorklet = { addModule: async () => {} };
-    async resume() {} async close() { this.state = "closed"; }
-    createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
-  };
-  window.AudioWorkletNode = class {
-    port = { onmessage: null, close() {} };
-    constructor() { window.__capture = this; } connect() {} disconnect() {}
-  };
-  window.Worker = class {
-    constructor() { queueMicrotask(() => this.onmessage?.({ data: { type: "ready" } })); }
-    postMessage(message) { if (message.type === "audio") queueMicrotask(() => this.onmessage?.({ data: { type: "processed", wake: true } })); }
-    terminate() { this.onmessage = null; }
-  };
-  window.__say = async () => {
-    const frame = level => window.__capture.port.onmessage({ data: new Float32Array(1600).fill(level) });
-    frame(0.1); await new Promise(resolve => setTimeout(resolve, 0));
-    for (let n = 0; n < 5; n++) frame(0.1);
-    for (let n = 0; n < 13; n++) frame(0);
-  };
-});
+await context.addInitScript(installVoiceInputStubs);
 const page = await context.newPage();
 const errors = [], submissions = [], mutations = [];
 page.on("pageerror", error => errors.push(error.message));

@@ -1,4 +1,10 @@
 import type { ApplyCodingRunRequest, ApplyCodingRunResponse, CodingRunRequest, CodingRunResponse, ConsultationRunRequest, ConsultationRunResponse, ModelBackendModelsResponse, ModelBackendPreflightSummary, ModelBackendSummary, PlanningRunRequest, PlanningRunResponse, RunEvent } from "@engineering-team/contracts";
+import { isWorkerAdmissionCode, WorkerAdmissionError } from "./worker-concurrency.js";
+
+function controllerRunError(body: unknown, message: string): Error {
+  const code = typeof body === "object" && body !== null && "error" in body ? body.error : undefined;
+  return isWorkerAdmissionCode(code) ? new WorkerAdmissionError(code, message) : new Error(message);
+}
 
 export interface TaskExecutionEvent {
   type: RunEvent["type"];
@@ -76,7 +82,7 @@ export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, Har
       const message = typeof body === "object" && body !== null && "message" in body
         ? String(body.message)
         : `Worker controller failed with status ${response.status}`;
-      throw new Error(message);
+      throw controllerRunError(body, message);
     }
     return body as PlanningRunResponse;
   }
@@ -131,7 +137,7 @@ export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, Har
       const message = typeof body === "object" && body !== null && "message" in body
         ? String(body.message)
         : `Worker controller consultation failed with status ${response.status}`;
-      throw new Error(message);
+      throw controllerRunError(body, message);
     }
     return body as ConsultationRunResponse;
   }
@@ -190,7 +196,7 @@ export class HttpPlanningExecutor implements PlanningExecutor, TaskExecutor, Har
       const message = typeof body === "object" && body !== null && "message" in body
         ? String(body.message)
         : `Worker controller task failed with status ${response.status}`;
-      throw new Error(message);
+      throw controllerRunError(body, message);
     }
     return body as CodingRunResponse;
   }

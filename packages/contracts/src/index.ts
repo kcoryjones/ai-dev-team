@@ -56,8 +56,6 @@ export interface ProjectSettingsSummary {
   setupCompletedAt: string | null;
   defaultRunTimeoutSeconds: number;
   defaultRunRetries: number;
-  defaultTokenBudget: number | null;
-  defaultCostBudgetCents: number | null;
   planningNetworkPolicy: PlanningNetworkPolicy;
   requirePlanApproval: boolean;
   createdAt: string;
@@ -68,8 +66,6 @@ export interface UpdateProjectSettingsInput {
   setupStatus?: ProjectSetupStatus;
   defaultRunTimeoutSeconds?: number;
   defaultRunRetries?: number;
-  defaultTokenBudget?: number | null;
-  defaultCostBudgetCents?: number | null;
   planningNetworkPolicy?: PlanningNetworkPolicy;
   requirePlanApproval?: boolean;
 }
@@ -551,15 +547,22 @@ export interface AgentQuestionInput {
   requestId: string;
   body: string;
   source: "voice" | "text";
+  followUpTo?: string;
 }
+
+export { voiceFollowUpTtlMs, maxVoiceFollowUpExchanges, maxVoiceFollowUpMessageCharacters } from "./voice-follow-up.js";
+
+export { ttsVoice, ttsSpeedRange, maxTtsTextCharacters, maxTtsRequestBytes, maxTtsAudioSeconds, maxTtsAudioBytes } from "./tts.js";
 
 export interface AgentQuestionResponse {
   message: AgentMessageSummary;
   run: AgentRunSummary;
   duplicate: boolean;
+  followUpTo?: string | null;
+  followUpExpiresAt?: string | null;
 }
 
-export { routeVoiceQuestion, routeVoiceRequest, voiceRoleLabels } from "./voice.js";
+export { routeVoiceQuestion, routeVoiceRequest, voiceRoleLabels, addressedVoiceRecipient } from "./voice.js";
 export type { VoiceQuestionRoute, VoiceRequestRoute, VoiceRecipient, VoiceCommandAction, VoiceCommandInput, VoiceCommandPreview, VoiceCommandReceipt } from "./voice.js";
 
 export interface CreatePlanInput {
@@ -680,8 +683,6 @@ export interface RunSpec {
   };
   limits: {
     timeoutSeconds: number;
-    tokenBudget?: number;
-    costBudgetCents?: number;
     retries: number;
   };
 }

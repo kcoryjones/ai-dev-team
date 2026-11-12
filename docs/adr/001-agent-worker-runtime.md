@@ -70,8 +70,6 @@ interface RunSpec {
 
   limits: {
     timeoutSeconds: number;
-    tokenBudget?: number;
-    costBudgetCents?: number;
     retries: number;
   };
 }
@@ -136,7 +134,7 @@ Repository content, issues, commit messages, dependency output, and external tex
 
 ### Provider adapters and brain profiles
 
-Roles have default brain profiles, but a role is never permanently bound to a provider or model. The orchestration policy may override a profile for a particular task, retry, risk level, or cost constraint.
+Roles have default brain profiles, but a role is never permanently bound to a provider or model. The orchestration policy may override a profile for a particular task, retry, or risk level.
 
 Codex is the first adapter. One-shot jobs may use non-interactive structured event output. Resumable conversations may use a provider thread/session through an SDK or application-server interface. Claude and RunPod adapters must implement the same Engineering Team contracts before they can be selected by the router.
 
@@ -159,13 +157,19 @@ Workers do not receive:
 
 The trusted control plane owns checkout creation, task leases, branch integration, commits or patch capture, pushing, merging, retries, and cleanup. Workers can modify only their assigned checkout when policy allows it.
 
+The API and trusted controller share `ENGINEERING_TEAM_CONTROLLER_TOKEN`. The controller rejects a missing or blank secret before opening its listener, and checks bearer authentication on every endpoint, including health checks. Compose passes the same configured secret to the API and controller; workers do not receive it. Startup tests cover missing, empty, and whitespace-only values, and HTTP boundary tests cover rejected requests and authenticated operations.
+
 The task controller accepts both `read-only` and `workspace-write` filesystem permissions. Read-only assessments, including Release Manager runs, receive a read-only repository bind mount and return evidence without capturing or publishing changes, regardless of agent role. Scratch files can use `/tmp`; checks that require modifying the supplied repository must be reported as unavailable under these permissions. Writable implementation runs retain the separate capture and publication path described below.
 
 Controller run schemas share validation for purpose, verification check, and verification round, using the contract's purpose/check values. Task requests reject unknown run fields rather than silently discarding them. The validated purpose selects the worker instructions and publication policy. Verification and release runs inspect the supplied base commit and return evidence without publishing worker edits or commits, including when their filesystem policy permits a writable clone for test artifacts. Implementation and repair runs retain change publication. The verification round is included in the worker's context.
 
 Provider credentials stay in the trusted controller. Each run receives a separate, read-only mount containing only a Unix socket to a constrained provider proxy. A credential-free worker launcher relays local Codex HTTP requests to that socket. The proxy accepts only model discovery, Responses, and compaction routes for the selected provider and model, applies bearer authentication or AWS SigV4, and streams successful responses without exposing credential-bearing headers or upstream error bodies. It never follows redirects. ChatGPT token refreshes are serialized and persisted in a controller-only directory, never mounted into a worker. Worker homes are empty temporary filesystems and worker environments contain no real provider credentials. The public Bedrock placeholder only selects Codex's built-in provider behavior; the controller replaces it with a signed request.
 
-The proxy is revoked and active upstream requests are aborted when a run ends. Repository commands can invoke their run's proxy while it is active; this separation protects provider credentials, not the run's spending budget. Endpoint-level enforcement of other worker network traffic remains future hardening.
+The controller stores rotated OAuth credentials in the dedicated `engineering-team-provider-auth` volume at `/provider-auth`, outside the app's and workers' mounts. The cache uses `0700` directories, `0600` files, and atomic replacement. Entries are keyed by the read-only source file's fingerprint. On first use, matching legacy credentials are copied from the temporary cache, if still present, or the old worktree cache; an existing private entry always wins, and invalid legacy entries do not silently fall back to stale source tokens. Upgrades from the temporary-cache version must export credentials before the old container stops, using the documented preservation helper. A Docker regression test imports legacy credentials, rotates them with a fake provider, recreates the container with empty tmpfs, and verifies continued refresh using the persisted token.
+
+Planning, consultation, and task workers use Docker's `--network none`: only container-local loopback is available. Model requests reach the controller through the mounted Unix socket, so the `model-provider-only` policy does not require worker network access. Direct connections to the internet, host services, other containers, and cloud metadata endpoints are unavailable. Dependencies needed for checks must already be in the image or checkout; workers cannot download packages under this policy.
+
+The proxy is revoked and active upstream requests are aborted when a run ends. Repository commands can invoke their run's proxy while it is active; this separation protects provider credentials, not the run's spending budget. Controller boundary tests require network isolation on every worker launch. The opt-in `ENGINEERING_TEAM_TEST_DOCKER_IMAGE=local/engineering-team-controller:latest npm test` check runs an unprivileged, isolated container against a fake provider and verifies working model relay access, rejected unrelated proxy routes, and blocked direct IPv4, IPv6, and link-local connections without calling a paid API.
 
 Coding output is captured through a separate controller-owned checkout that is never mounted into a worker. After the worker stops, the controller copies its working files into that checkout while excluding all Git metadata. Directory substitutions and special files are rejected; symlinks are preserved as link text without reading their targets. Commits are constructed from this file snapshot, not from the worker's index, object database, configuration, or commit history. Capture Git commands use an isolated environment with hooks and configuration-driven helpers disabled. The source repository receives the resulting branch through a local fetch from the private checkout, avoiding receiving hooks from a local push.
 
@@ -174,6 +178,10 @@ A task may change only some of its assigned repositories. Capture finishes for e
 If capture fails, no branches from that run have been published. If publication fails partway through, the failed result records all confirmed published commits, branches, and files, preventing them from disappearing from workflow history. This is not atomic publication across repositories and does not provide restart recovery for a controller crash during publication. Approval also checks that unchanged assigned repositories still match the assessed bases.
 
 ### Run lifecycle
+
+One controller-wide admission pool limits workers across projects and run types, including harness probes. `ENGINEERING_TEAM_MAX_WORKERS` defaults to two and must be a positive integer. Admission reserves a slot before repository preparation and releases it only after execution and cleanup. Excess requests and duplicate active run IDs receive typed HTTP 409 errors; the API preserves those errors so they do not trigger provider fallback, and unavailable verification workers do not trigger code repair. There is no background queue or added queue delay in run timeouts.
+
+Containers are created before they are started, allowing cancellation during creation to prevent execution. Disconnected request clients cancel their active reservation. Docker containers are removed explicitly on success, failure, timeout, or cancellation; removal failures block further admission until periodic cleanup or an explicit stop succeeds. Every worker carries a controller-owner label derived from the persistent worktree volume, and startup removes only that owner's leftover containers before opening the listener. A worktree volume belongs to one controller instance. These controls bound concurrent workers, not token or cost usage.
 
 The standard lifecycle is:
 
@@ -264,5 +272,5 @@ Each rerun uses execution history after its requeue event. Rejected work can be 
 - Exact provider and model assignments by role.
 - Provider-specific CLI flags and authentication mechanisms.
 - The first RunPod model and whether it requires a compatibility gateway.
-- Detailed cost-routing and fallback thresholds.
+- Detailed fallback thresholds.
 - Whether long-running conversational workers are ever justified for selected local-only deployments.

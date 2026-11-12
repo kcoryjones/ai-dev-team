@@ -190,8 +190,8 @@ describe("TeamDatabase", () => {
     assert.equal(defaults.setupCompletedAt, null);
     assert.equal(defaults.defaultRunTimeoutSeconds, 900);
     assert.equal(defaults.defaultRunRetries, 1);
-    assert.equal(defaults.defaultTokenBudget, null);
-    assert.equal(defaults.defaultCostBudgetCents, null);
+    assert(!("defaultTokenBudget" in defaults));
+    assert(!("defaultCostBudgetCents" in defaults));
     assert.equal(defaults.planningNetworkPolicy, "model-provider-only");
     assert.equal(defaults.requirePlanApproval, true);
 
@@ -199,24 +199,19 @@ describe("TeamDatabase", () => {
       setupStatus: "completed",
       defaultRunTimeoutSeconds: 1_200,
       defaultRunRetries: 2,
-      defaultTokenBudget: 25_000,
-      defaultCostBudgetCents: 500,
       planningNetworkPolicy: "restricted",
       requirePlanApproval: false,
     });
     assert.equal(completed.setupStatus, "completed");
     assert.ok(completed.setupCompletedAt);
-    assert.equal(completed.defaultTokenBudget, 25_000);
     assert.equal(completed.requirePlanApproval, false);
 
     const reopened = database.updateProjectSettings("project-1", {
       setupStatus: "in_progress",
-      defaultTokenBudget: null,
-      defaultCostBudgetCents: null,
     });
     assert.equal(reopened.setupCompletedAt, null);
-    assert.equal(reopened.defaultTokenBudget, null);
-    assert.equal(reopened.defaultCostBudgetCents, null);
+    assert(!("defaultTokenBudget" in reopened));
+    assert(!("defaultCostBudgetCents" in reopened));
 
     const event = database.connection
       .prepare(
@@ -227,9 +222,39 @@ describe("TeamDatabase", () => {
       .get("project-1") as { payload_json: string };
     assert.deepEqual(
       (JSON.parse(event.payload_json) as { changedFields: string[] }).changedFields.sort(),
-      ["defaultCostBudgetCents", "defaultTokenBudget", "setupStatus"].sort(),
+      ["setupStatus"],
     );
     database.close();
+  });
+
+  it("removes retired token and cost settings during upgrade without changing other settings or history", () => {
+    const database = new TeamDatabase(":memory:");
+    try {
+      database.createProject({ id: "project-1", name: "Builder", repository: {
+        id: "repository-1", name: "builder", relativePath: "builder", defaultBranch: "main",
+      } });
+      const settings = database.updateProjectSettings("project-1", {
+        defaultRunTimeoutSeconds: 1_200, defaultRunRetries: 2, planningNetworkPolicy: "restricted",
+      });
+      const history = database.connection.prepare("SELECT * FROM events ORDER BY id").all();
+      // Restore the version-28 settings columns, including saved values, to
+      // exercise an upgrade as well as fresh-database migration.
+      database.connection.exec(`
+        ALTER TABLE project_settings ADD COLUMN default_token_budget INTEGER
+          CHECK (default_token_budget IS NULL OR default_token_budget BETWEEN 1 AND 10000000);
+        ALTER TABLE project_settings ADD COLUMN default_cost_budget_cents REAL
+          CHECK (default_cost_budget_cents IS NULL OR default_cost_budget_cents > 0);
+        UPDATE project_settings SET default_token_budget = 25000, default_cost_budget_cents = 500;
+        DELETE FROM schema_migrations WHERE version = 29;
+      `);
+      migrate(database.connection);
+      migrate(database.connection);
+      const columns = database.connection.prepare("PRAGMA table_info(project_settings)").all() as Array<{ name: string }>;
+      assert(!columns.some(column => ["default_token_budget", "default_cost_budget_cents"].includes(column.name)));
+      assert.deepEqual(database.getProjectSettings("project-1"), settings);
+      assert.deepEqual(database.connection.prepare("SELECT * FROM events ORDER BY id").all(), history);
+      assert.equal(database.updateProjectSettings("project-1", { defaultRunRetries: 3 }).defaultRunRetries, 3);
+    } finally { database.close(); }
   });
 
   it("persists reusable model backend configurations without storing secrets", () => {
@@ -567,7 +592,7 @@ describe("TeamDatabase", () => {
         networkPolicy: "model-provider-only",
         allowedTools: ["propose_task_plan"],
       },
-      limits: { timeoutSeconds: 300, retries: 1, tokenBudget: 20_000 },
+      limits: { timeoutSeconds: 300, retries: 1 },
     };
 
     assert.equal(database.createAgentRun(profile.id, spec).status, "queued");

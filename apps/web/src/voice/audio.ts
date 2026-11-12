@@ -52,14 +52,14 @@ export function encodeVoiceWave(samples: Float32Array): ArrayBuffer {
   return buffer;
 }
 
-/** Silence endpoint for V1; thresholds can be tuned after microphone trials. */
+/** Bounded endpointing; wake-word detection itself uses the installed model. */
 export class VoiceSegment {
   private chunks: Float32Array[];
   private count: number;
   private elapsed = 0;
   private quiet = 0;
   private speech = 0;
-  constructor(preRoll: Float32Array[]) {
+  constructor(preRoll: Float32Array[], private threshold = 0.012, private silenceSeconds = 1.2) {
     this.chunks = preRoll.slice();
     this.count = preRoll.reduce((total, frame) => total + frame.length, 0);
   }
@@ -69,9 +69,9 @@ export class VoiceSegment {
     this.count += chunk.length;
     this.elapsed += frame.length;
     const rms = Math.sqrt(frame.reduce((total, sample) => total + sample * sample, 0) / Math.max(1, frame.length));
-    if (rms >= 0.012) { this.speech += frame.length; this.quiet = 0; }
+    if (rms >= this.threshold) { this.speech += frame.length; this.quiet = 0; }
     else this.quiet += frame.length;
-    if (this.speech >= voiceSampleRate * 0.12 && this.quiet >= voiceSampleRate * 1.2) return "complete";
+    if (this.speech >= voiceSampleRate * 0.12 && this.quiet >= voiceSampleRate * this.silenceSeconds) return "complete";
     if (this.count >= maxVoiceSamples) return "complete";
     if (this.elapsed >= voiceSampleRate * 5 && this.speech === 0) return "empty";
     return "continue";

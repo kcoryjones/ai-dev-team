@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
-import { agentRoles, type AgentRole, type AgentQuestionResponse, type ConsultationRunRequest, type ConsultationRunResponse } from "@engineering-team/contracts";
+import { agentRoles, voiceFollowUpTtlMs, maxVoiceFollowUpExchanges, maxVoiceFollowUpMessageCharacters, type AgentRole, type AgentQuestionResponse, type ConsultationRunRequest, type ConsultationRunResponse } from "@engineering-team/contracts";
 import { TeamDatabase } from "@engineering-team/database";
 import { createApp } from "./app.js";
 import { questionActivityContext } from "./question-context.js";
@@ -218,4 +218,102 @@ test("activity snapshots prioritize blocked work and stay within the controller 
   assert.equal(parsed.tasks[0].id, "150");
   assert.equal(parsed.tasks[0].dependencies[0].status, "in_progress");
   assert.equal(parsed.omittedTasks, 200 - parsed.tasks.length);
+});
+
+test("voice follow-ups use only the accepted question chain and preserve read-only task isolation", async t => {
+  const f = fixture(t, async request => answer({ response: `Answer to: ${request.question}` }));
+  const task = runningTask(f.database, f.projectId);
+  f.database.createAgentMessage({ id: randomUUID(), projectId: f.projectId, agentRole: "backend_developer", author: "agent", body: "Unrelated old chat" });
+  const root = { requestId: randomUUID(), body: "What is blocked?", source: "voice" };
+  assert.equal((await f.send("backend_developer", root)).status, 202); await tick();
+  const first = f.database.getAgentQuestionRequest(f.projectId, root.requestId)!;
+  assert.equal(Date.parse(first.followUpExpiresAt!), Date.parse(first.run.completedAt!) + voiceFollowUpTtlMs);
+  assert.deepEqual(f.calls[0]!.conversation, [{ author: "director", body: root.body }]);
+  const follow = { requestId: randomUUID(), body: "And why?", source: "voice", followUpTo: root.requestId };
+  assert.equal((await f.send("backend_developer", follow)).status, 202); await tick();
+  assert.deepEqual(f.calls[1]!.conversation, [
+    { author: "director", body: root.body }, { author: "agent", body: `Answer to: ${root.body}` }, { author: "director", body: follow.body },
+  ]);
+  assert.equal(f.calls[1]!.questionOnly, true);
+  assert.equal(f.calls[1]!.run.permissions.filesystem, "read-only");
+  assert.equal(f.database.getAgentRun(task.runId)!.status, "running");
+  assert.deepEqual(f.stopped, []);
+  assert.equal((await f.send("backend_developer", { requestId: randomUUID(), body: "Start a fresh discussion?", source: "voice" })).status, 202); await tick();
+  assert.equal(f.calls.at(-1)!.conversation.length, 1, "resetting the chain must actually omit previous voice history");
+  assert.equal(f.database.getOrchestrationState(f.projectId)!.messages.some(message => message.body === "Unrelated old chat"), true);
+});
+
+test("follow-up history bounds exchanges and message sizes independently of recent activity history", async t => {
+  const f = fixture(t, async request => answer({ response: `Answer ${request.question} ` + "detail ".repeat(700) }));
+  let previous: string | undefined;
+  for (let index = 0; index < 6; index++) {
+    const requestId = randomUUID();
+    const input = { requestId, body: `Question ${index}?`, source: "voice", ...(previous ? { followUpTo: previous } : {}) };
+    assert.equal((await f.send("architect", input)).status, 202); await tick(); previous = requestId;
+  }
+  const conversation = f.calls.at(-1)!.conversation;
+  assert.equal(conversation.length, maxVoiceFollowUpExchanges * 2 + 1);
+  assert.equal(conversation[0]!.body, "Question 2?");
+  assert.equal(conversation.at(-1)!.body, "Question 5?");
+  assert.ok(conversation.every(message => message.body.length <= maxVoiceFollowUpMessageCharacters));
+  assert.match(conversation[1]!.body, /Earlier message truncated/);
+  const last = f.database.getAgentQuestionRequest(f.projectId, previous!)!;
+  appendCompletedHistory(f.database, last.run);
+  assert.equal((await f.send("architect", { requestId: randomUUID(), source: "voice", body: "What else?", followUpTo: previous })).status, 202); await tick();
+  assert.equal(f.calls.at(-1)!.conversation.at(-2)!.body.startsWith("Answer Question 5?"), true);
+});
+
+test("expired parents reject new follow-ups while accepted retries and persisted chains remain stable", async t => {
+  const f = fixture(t);
+  const root = { requestId: randomUUID(), body: "What is next?", source: "voice" };
+  await f.send("architect", root); await tick();
+  const input = { requestId: randomUUID(), body: "Why?", source: "voice", followUpTo: root.requestId };
+  const responses = await Promise.all([f.send("architect", input), f.send("architect", input)]); await tick();
+  assert.deepEqual(responses.map(response => response.status).sort(), [200, 202]);
+  const parent = f.database.getAgentQuestionRequest(f.projectId, root.requestId)!;
+  f.database.connection.prepare("UPDATE agent_runs SET completed_at = ? WHERE id = ?").run(new Date(Date.now() - voiceFollowUpTtlMs - 1000).toISOString(), parent.run.id);
+  const before = f.database.listAgentRuns(f.projectId).length;
+  const expired = await f.send("architect", { ...input, requestId: randomUUID() });
+  assert.equal(expired.status, 409); assert.equal((await expired.json()).error, "follow_up_unavailable");
+  assert.equal(f.database.listAgentRuns(f.projectId).length, before);
+  const reopened = new TeamDatabase(f.path);
+  try {
+    const app = createApp(reopened, f.options);
+    const retry = await app.request(`/api/projects/${f.projectId}/agents/architect/questions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+    assert.equal(retry.status, 200); assert.equal(f.calls.length, 2);
+    assert.equal((await retry.json()).followUpTo, root.requestId);
+    assert.equal((await f.send("architect", { ...input, followUpTo: undefined })).status, 409);
+    assert.equal((await f.send("architect", { ...input, followUpTo: randomUUID() })).status, 409);
+    assert.equal((await f.send("architect", { requestId: randomUUID(), body: "What else?", source: "voice", followUpTo: input.requestId })).status, 202); await tick();
+    assert.equal(f.calls.at(-1)!.conversation.length, 5, "an expired ancestor remains usable inside an admitted, continuing chain");
+  } finally { reopened.close(); }
+});
+
+test("follow-up admission rejects wrong projects, roles, sources, and incomplete or failed parents", async t => {
+  const f = fixture(t);
+  const root = { requestId: randomUUID(), body: "What is next?", source: "voice" };
+  await f.send("architect", root); await tick();
+  const parent = f.database.getAgentQuestionRequest(f.projectId, root.requestId)!;
+  const invalid = () => ({ requestId: randomUUID(), body: "Why?", source: "voice", followUpTo: root.requestId });
+  assert.equal((await f.send("backend_developer", invalid())).status, 409);
+  assert.equal((await f.send("architect", { ...invalid(), source: "text" })).status, 400);
+  assert.equal((await f.send("architect", { ...invalid(), conversation: [{ author: "agent", body: "Invented history" }] })).status, 400);
+  assert.equal((await f.send("architect", { ...invalid(), followUpTo: randomUUID() })).status, 409);
+  for (const status of ["failed", "cancelled", "running"]) {
+    f.database.connection.prepare("UPDATE agent_runs SET status = ? WHERE id = ?").run(status, parent.run.id);
+    const response = await f.send("architect", invalid());
+    assert.equal(response.status, 409); assert.equal((await response.json()).error, "follow_up_unavailable");
+  }
+  f.database.connection.prepare("UPDATE agent_runs SET status = 'completed' WHERE id = ?").run(parent.run.id);
+  const typed = { requestId: randomUUID(), body: "Typed question?", source: "text" };
+  await f.send("architect", typed); await tick();
+  assert.equal((await f.send("architect", { ...invalid(), followUpTo: typed.requestId })).status, 409);
+  const otherProject = randomUUID(); f.database.createProject({ id: otherProject, name: "Other", repository: { id: randomUUID(), name: "other", relativePath: "other", defaultBranch: "main" } });
+  const profile = f.database.createBrainProfile({ id: randomUUID(), projectId: otherProject, name: "Other", provider: "openai", harness: "codex", modelClass: "coding", credentialRef: "FIXTURE", configuration: {} });
+  const otherId = randomUUID(), attemptId = randomUUID();
+  const other = f.database.createAgentQuestion({ requestId: otherId, source: "voice", body: "Other project?", messageId: randomUUID(), brainProfileId: profile.id,
+    spec: { ...parent.run.spec, projectId: otherProject, runId: randomUUID(), brainProfile: { provider: "openai", harness: "codex", modelClass: "coding", credentialRef: "FIXTURE" } }, attemptId });
+  f.database.completeAgentRun(other.run.id, attemptId, parent.run.result!);
+  assert.equal((await f.send("architect", { ...invalid(), followUpTo: otherId })).status, 409);
+  assert.equal(f.calls.length, 2, "invalid references must never create workers");
 });

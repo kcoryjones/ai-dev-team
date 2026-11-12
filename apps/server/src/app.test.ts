@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { TeamDatabase } from "@engineering-team/database";
 import { createApp } from "./app.js";
+import { WorkerAdmissionError } from "./worker-concurrency.js";
 import { createRepository as createGitRepository } from "./repository.js";
 import { appendCompletedHistory } from "./test-history.js";
 
@@ -43,6 +44,8 @@ describe("local API", () => {
         requirePlanApproval: boolean;
       };
     };
+    assert(!("defaultTokenBudget" in defaults.settings));
+    assert(!("defaultCostBudgetCents" in defaults.settings));
     assert.deepEqual(
       {
         setupStatus: defaults.settings.setupStatus,
@@ -64,18 +67,27 @@ describe("local API", () => {
       body: JSON.stringify({
         setupStatus: "completed",
         defaultRunTimeoutSeconds: 1_800,
-        defaultTokenBudget: 50_000,
-        defaultCostBudgetCents: 250,
         planningNetworkPolicy: "restricted",
       }),
     });
     assert.equal(updateResponse.status, 200);
     const updated = (await updateResponse.json()) as {
-      settings: { setupStatus: string; setupCompletedAt: string | null; defaultTokenBudget: number };
+      settings: { setupStatus: string; setupCompletedAt: string | null; defaultRunTimeoutSeconds: number };
     };
     assert.equal(updated.settings.setupStatus, "completed");
     assert.ok(updated.settings.setupCompletedAt);
-    assert.equal(updated.settings.defaultTokenBudget, 50_000);
+    assert.equal(updated.settings.defaultRunTimeoutSeconds, 1_800);
+    assert(!("defaultTokenBudget" in updated.settings));
+    assert(!("defaultCostBudgetCents" in updated.settings));
+
+    for (const setting of ["defaultTokenBudget", "defaultCostBudgetCents"]) {
+      const retiredSettingResponse = await app.request(`/api/projects/${created.project.id}/settings`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ [setting]: 250 }),
+      });
+      assert.equal(retiredSettingResponse.status, 400);
+    }
 
     const invalidResponse = await app.request(`/api/projects/${created.project.id}/settings`, {
       method: "PATCH",
@@ -1511,6 +1523,80 @@ describe("local API", () => {
     database.close();
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
+
+  for (const [repairLimit, busyStage] of [[0, null], [1, null], [2, null], [5, null], [2, "implementation"], [2, "verification"], [2, "repair"]] as const) {
+    it(busyStage ? `controller admission denied at ${busyStage} does not cause provider fallback or extra repairs`
+      : `persists a ${repairLimit}-repair limit and stops after that many repairs when verification keeps failing`, async t => {
+      const database = new TeamDatabase(":memory:");
+      const workspaceRoot = mkdtempSync(join(tmpdir(), "engineering-team-repair-limit-"));
+      t.after(() => { database.close(); rmSync(workspaceRoot, { recursive: true, force: true }); });
+      const projectId = "55555555-5555-4555-8555-555555555555", repositoryId = "66666666-6666-4666-8666-666666666666";
+      createGitRepository(workspaceRoot, "backend");
+      database.createProject({ id: projectId, name: "Repair limits", repository: { id: repositoryId, name: "backend", relativePath: "backend", defaultBranch: "main" } });
+      database.createCodingHarness(projectId, "harness", { name: "Codex", adapter: "codex", executable: "codex", supportedProtocols: ["openai-responses"], capabilities: ["coding", "testing"] });
+      database.createModelBackend(projectId, "model", { name: "Fixture", provider: "openai", protocol: "openai-responses", model: "test", authMode: "chatgpt" });
+      database.createModelBackend(projectId, "fallback", { name: "Fallback", provider: "openai", protocol: "openai-responses", model: "fallback-test", authMode: "chatgpt" });
+      for (const role of ["backend_developer", "qa_engineer", "release_manager"] as const) database.assignAgentRuntime(projectId, role, "harness", "model", "harness", "fallback");
+      let repairs = 0, verifications = 0;
+      const purposes: string[] = [];
+      const app = createApp(database, { workspaceRoot, taskExecutor: {
+        async executeTask(request) {
+          assert.equal(request.run.limits.retries, repairLimit);
+          assert.deepEqual(request.run.limits, { timeoutSeconds: 900, retries: repairLimit });
+          assert.equal(request.run.brainProfile.model, "test");
+          const purpose = request.run.runPurpose ?? "implementation";
+          purposes.push(purpose);
+          assert(["implementation", "repair", "verification"].includes(purpose), "Failed verification must not reach release");
+          const verification = purpose === "verification";
+          if (verification) verifications++;
+          if (purpose === "repair") {
+            repairs++;
+            assert(repairs <= repairLimit, "Repair limit exceeded");
+          }
+          if (purpose === busyStage) throw new WorkerAdmissionError("worker_limit_reached", "Worker capacity is temporarily unavailable");
+          const sha = String(repairs + 1).padStart(40, "0");
+          return {
+            workerId: `fixture-${request.run.runId}`, imageDigest: "sha256:fixture", providerThreadId: null,
+            branches: verification ? [] : [{ repositoryId, branch: `agent/repair-limit-${repairs}`, sha }],
+            result: {
+              schemaVersion: 1, status: verification ? "failed" : "completed", summary: verification ? "Blocking regression remains." : "Implementation completed.",
+              changedFiles: verification ? [] : ["backend/index.ts"], commits: verification ? [] : [{ repositoryId, sha }],
+              checks: [{ command: "fixture check", status: verification ? "failed" : "passed" }],
+              acceptanceCriteria: request.run.acceptanceCriteria.map(criterion => ({ criterion, satisfied: !verification, evidence: "Fixture evidence" })),
+              questions: [], risks: [], artifacts: [],
+            },
+          };
+        },
+        async applyTask() { throw new Error("Unverified work must not be applied"); },
+      } });
+      const saved = await app.request(`/api/projects/${projectId}/settings`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ defaultRunRetries: repairLimit }),
+      });
+      assert.equal(saved.status, 200);
+      const settings = await (await app.request(`/api/projects/${projectId}/settings`)).json() as { settings: { defaultRunRetries: number } };
+      assert.equal(settings.settings.defaultRunRetries, repairLimit);
+      const plan = database.createPlan({ projectId, approvalId: "repair-approval", objective: { id: "repair-objective", title: "Repair", description: "Bound repeated repairs" },
+        tasks: [{ id: "repair-task", key: "repair", title: "Repair", description: "Fix a regression", assignedRole: "backend_developer", repositoryIds: [repositoryId], acceptanceCriteria: ["Works"], requiredChecks: { qa: true, codeReview: false, security: false }, dependsOn: [] }],
+      });
+      database.decideApproval(projectId, plan.approval.id, "approved", null);
+      const started = await app.request(`/api/projects/${projectId}/tasks/repair-task/runs`, { method: "POST" });
+      assert.equal(started.status, 202, await started.text());
+      await new Promise(resolve => setImmediate(resolve));
+      const expectedRepairs = busyStage ? Number(busyStage === "repair") : repairLimit;
+      assert.equal(repairs, expectedRepairs);
+      assert.equal(verifications, busyStage ? Number(busyStage !== "implementation") : repairLimit + 1);
+      assert.deepEqual(purposes, busyStage === "implementation" ? ["implementation"] : busyStage === "verification" ? ["implementation", "verification"]
+        : busyStage === "repair" ? ["implementation", "verification", "repair"]
+        : ["implementation", "verification", ...Array.from({ length: repairLimit }, () => ["repair", "verification"]).flat()]);
+      const state = database.getOrchestrationState(projectId)!;
+      assert.equal(state.tasks[0]?.status, "in_progress");
+      assert.deepEqual(state.integrationProposals, []);
+      const runs = database.listAgentRunsForTask(projectId, "repair-task");
+      assert.equal(runs.filter(run => run.spec.runPurpose === "repair").length, expectedRepairs);
+      assert(runs.every(run => !database.listRunEvents(run.id).some(event => event.type === "runtime.fallback")));
+      if (busyStage && busyStage !== "implementation") assert.equal(runs.find(run => run.spec.runPurpose === "implementation")?.result?.commits.length, 1);
+    });
+  }
 
   it("resumes interrupted verification without repeating checks that already passed", async () => {
     const database = new TeamDatabase(":memory:");

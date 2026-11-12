@@ -14,7 +14,7 @@ const root = mkdtempSync(join(tmpdir(), 'builder-voice-questions-'));
 const database = new TeamDatabase(root + '/team.sqlite');
 const projectId = randomUUID(), repositoryId = randomUUID();
 createRepository(root, 'backend');
-database.createProject({ id: projectId, name: 'Voice control test', repository: { id: repositoryId, name: 'backend', relativePath: 'backend', defaultBranch: 'main' } });
+database.createProject({ id: projectId, name: 'Voice test — simulated agents', repository: { id: repositoryId, name: 'backend', relativePath: 'backend', defaultBranch: 'main' } });
 database.createCodingHarness(projectId, 'harness', { name: 'Codex fixture', adapter: 'codex', executable: 'codex', supportedProtocols: ['openai-responses'], capabilities: ['planning', 'coding', 'testing'] });
 database.createModelBackend(projectId, 'backend', { name: 'Model fixture', provider: 'openai', protocol: 'openai-responses', model: 'test', authMode: 'chatgpt' });
 for (const role of agentRoles) database.assignAgentRuntime(projectId, role, 'harness', 'backend');
@@ -27,13 +27,23 @@ database.createAgentRun(profile.id, { schemaVersion: 1, runId, projectId, taskId
 database.createRunAttempt({ id: attemptId, runId, attemptNumber: 1 });
 database.markRunAttemptRunning(attemptId, 'fixture', 'sha256:fixture');
 database.acquireTaskLease({ taskId, runId, leaseToken: randomUUID(), acquiredAt: new Date().toISOString(), heartbeatAt: new Date().toISOString(), expiresAt: '2099-01-01T00:00:00.000Z' });
-const app = createApp(database, { workspaceRoot: root, staticRoot: fileURLToPath(new URL('../apps/web/dist', import.meta.url)), planningExecutor: {
+const app = createApp(database, { workspaceRoot: root, staticRoot: fileURLToPath(new URL('../apps/web/dist', import.meta.url)),
+  ...(process.env.VOICE_TEST_TTS_URL ? { ttsUrl: process.env.VOICE_TEST_TTS_URL } : {}),
+  ...(process.env.VOICE_TEST_SPEECH_URL ? { speechUrl: process.env.VOICE_TEST_SPEECH_URL } : {}), planningExecutor: {
   async execute() { return { workerId: 'planner-fixture', imageDigest: 'test', providerThreadId: null, proposal: {
     intent: 'plan', assistantMessage: 'Proposed the requested work.', directiveActions: [], consultationRequests: [], contextUpdates: [],
     objective: { title: 'Voice requested work', description: 'Test the normal approval flow' },
     tasks: [{ key: 'new', title: 'Add requested feature', description: 'Implement the requested feature', assignedRole: 'frontend_developer', repositoryIds: [repositoryId], acceptanceCriteria: ['Feature works'], requiredChecks: { qa: true, codeReview: true, security: true }, dependsOn: [] }],
   } }; },
-  async consult(request) { await new Promise(resolve => setTimeout(resolve, 3000)); return { workerId: 'fixture', imageDigest: 'sha256:fixture', providerThreadId: null, response: 'Answer from ' + request.run.agentRole + ': the backend task is still running.', directiveActions: [], contextUpdates: [] }; },
+  async consult(request) {
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    const history = process.env.VOICE_TEST_FOLLOW_UP_CONTEXT === '1'
+      ? '\nEarlier questions: ' + (request.conversation.slice(0, -1).filter(message => message.author === 'director').map(message => message.body).join(' | ') || '(none)') : '';
+    const response = process.env.VOICE_TEST_ECHO_REPLY === '1'
+      ? 'To ask a question, say: Hey Dev Team. Architect, what is blocking progress?'
+      : 'Answer from ' + request.run.agentRole + ': the backend task is still running.' + history;
+    return { workerId: 'fixture', imageDigest: 'sha256:fixture', providerThreadId: null, response, directiveActions: [], contextUpdates: [] };
+  },
   async stopAgentWorker() {},
 }, taskExecutor: {
   async stopTaskWorker() {},

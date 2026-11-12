@@ -6,14 +6,25 @@ class VoiceCaptureProcessor extends AudioWorkletProcessor {
     this.resampler = new VoiceResampler(sampleRate);
     this.frame = new Float32Array(1600);
     this.offset = 0;
+    this.epoch = 0;
+    this.paused = false;
+    this.port.onmessage = event => {
+      if (event.data.type !== "reset") return;
+      this.epoch = event.data.epoch;
+      this.paused = event.data.paused;
+      this.resampler = new VoiceResampler(sampleRate);
+      this.frame = new Float32Array(1600);
+      this.offset = 0;
+    };
   }
   process(inputs) {
+    if (this.paused) return true;
     const channel = inputs[0]?.[0];
     if (channel) {
       for (const sample of this.resampler.push(channel)) {
         this.frame[this.offset++] = sample;
         if (this.offset === this.frame.length) {
-          this.port.postMessage(this.frame, [this.frame.buffer]);
+          this.port.postMessage({ epoch: this.epoch, samples: this.frame }, [this.frame.buffer]);
           this.frame = new Float32Array(1600);
           this.offset = 0;
         }

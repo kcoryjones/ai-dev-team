@@ -833,6 +833,19 @@ const migrations: Migration[] = [
       );
     `,
   },
+  {
+    version: 29,
+    name: "remove_unused_execution_budgets",
+    sql: `
+      ALTER TABLE project_settings DROP COLUMN default_token_budget;
+      ALTER TABLE project_settings DROP COLUMN default_cost_budget_cents;
+    `,
+  },
+  {
+    version: 30,
+    name: "voice_question_follow_ups",
+    sql: `ALTER TABLE agent_question_requests ADD COLUMN follow_up_to TEXT;`,
+  },
 ];
 
 export function migrate(database: Database.Database): void {

@@ -29,6 +29,20 @@ test("unclear recipients, statements and work directives wait for clarification"
   assert.equal(routeVoiceQuestion("Architect, how should we fix the API?").status, "ready");
 });
 
+test("the reported back in developer transcription routes questions without bypassing action review", () => {
+  for (const text of ["Hey Dev Team. Back in developer, what is blocking progress?", "back in developer what is blocking progress?"]) {
+    assert.deepEqual(routeVoiceRequest(text), {
+      intent: "question", recipient: "backend_developer", body: "what is blocking progress?", reason: null, autoSubmit: true,
+    });
+  }
+  const action = routeVoiceRequest("Back in developer, fix the API.");
+  assert.equal(action.recipient, "backend_developer");
+  assert.equal(action.intent, "new_work");
+  assert.equal(action.autoSubmit, false);
+  assert.equal(routeVoiceRequest("Back in developer and Architect, what is next?").autoSubmit, false);
+  assert.equal(routeVoiceRequest("What did the back in developer say?").recipient, "team");
+});
+
 test("voice work, guidance and standing instructions require review and preserve scope", () => {
   for (const [text, action, recipient] of [
     ["Hey Dev Team. Backend, build a health endpoint.", "new_work", "backend_developer"],

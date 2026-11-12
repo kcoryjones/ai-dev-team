@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { WorkerAdmissionError } from "./worker-concurrency.js";
 import { basename, relative, resolve } from "node:path";
 import type {
   AddProjectRepositoryInput,
@@ -42,12 +43,13 @@ import type {
   UpdateTaskStatusInput,
 } from "@engineering-team/contracts";
 import { agentRoles, reportOnlyTaskAgentRoles, runContractSchemaVersion } from "@engineering-team/contracts";
-import type { TeamDatabase } from "@engineering-team/database";
+import { QuestionFollowUpError, type TeamDatabase } from "@engineering-team/database";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
 import { z } from "zod";
 import { taskAcceptanceCriteriaSchema } from "./coding-result.js";
 import { createVoiceRoutes } from "./voice.js";
+import { createTtsRoutes } from "./tts-routes.js";
 import { registerVoiceCommands } from "./voice-commands.js";
 import { questionActivityContext } from "./question-context.js";
 import type { HarnessInspector, PlanningExecutor, TaskExecutor } from "./planning.js";
@@ -220,8 +222,6 @@ const updateProjectSettingsSchema = z
     setupStatus: z.enum(["not_started", "in_progress", "completed"]).optional(),
     defaultRunTimeoutSeconds: z.number().int().min(30).max(86_400).optional(),
     defaultRunRetries: z.number().int().min(0).max(5).optional(),
-    defaultTokenBudget: z.number().int().min(1).max(10_000_000).nullable().optional(),
-    defaultCostBudgetCents: z.number().positive().max(1_000_000).nullable().optional(),
     planningNetworkPolicy: z.enum(["offline", "model-provider-only", "restricted"]).optional(),
     requirePlanApproval: z.boolean().optional(),
   })
@@ -442,6 +442,7 @@ export interface AppOptions {
   workspaceName?: string;
   staticRoot?: string;
   speechUrl?: string;
+  ttsUrl?: string;
   planningExecutor?: PlanningExecutor;
   taskExecutor?: TaskExecutor;
   harnessInspector?: HarnessInspector;
@@ -450,6 +451,7 @@ export interface AppOptions {
 export function createApp(database: TeamDatabase, options: AppOptions): Hono {
   const app = new Hono();
   app.route("/api/voice", createVoiceRoutes(options.speechUrl));
+  app.route("/api/voice/tts", createTtsRoutes(options.ttsUrl));
 
   app.onError((error, context) => {
     console.error("Unhandled API error", error);
@@ -1353,12 +1355,13 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
     try { body = await context.req.json<AgentQuestionInput>(); } catch {
       return context.json({ error: "invalid_json", message: "Request body must be valid JSON" }, 400);
     }
-    const parsed = z.object({ requestId: z.string().uuid(), body: z.string().trim().min(1).max(2_000), source: z.enum(["voice", "text"]) }).strict().safeParse(body);
+    const parsed = z.object({ requestId: z.string().uuid(), body: z.string().trim().min(1).max(2_000), source: z.enum(["voice", "text"]), followUpTo: z.string().uuid().optional() })
+      .strict().refine(input => !input.followUpTo || input.source === "voice", "Only voice questions support follow-up context.").safeParse(body);
     if (!parsed.success) return context.json({ error: "invalid_question", message: parsed.error.issues[0]?.message ?? "Invalid question" }, 400);
     try {
       const existing = database.getAgentQuestionRequest(projectId, parsed.data.requestId);
       if (existing) {
-        if (existing.message.agentRole !== role || existing.message.body !== parsed.data.body || existing.source !== parsed.data.source) {
+        if (existing.message.agentRole !== role || existing.message.body !== parsed.data.body || existing.source !== parsed.data.source || (existing.followUpTo ?? null) !== (parsed.data.followUpTo ?? null)) {
           return context.json({ error: "question_conflict", message: "This request ID was already used for a different question." }, 409);
         }
         return context.json(existing, 200);
@@ -1387,11 +1390,10 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
         upstreamArtifacts: [`director-message:${messageId}`, `director-question:${messageId}`],
         permissions: { filesystem: "read-only", networkPolicy: "model-provider-only", allowedTools: ["inspect_repository", "respond_to_request"] },
         limits: { timeoutSeconds: settings.defaultRunTimeoutSeconds, retries: settings.defaultRunRetries,
-          ...(settings.defaultTokenBudget === null ? {} : { tokenBudget: settings.defaultTokenBudget }),
-          ...(settings.defaultCostBudgetCents === null ? {} : { costBudgetCents: settings.defaultCostBudgetCents }),
         },
       };
       const receipt = database.createAgentQuestion({ requestId: parsed.data.requestId, source: parsed.data.source,
+        ...(parsed.data.followUpTo ? { followUpTo: parsed.data.followUpTo } : {}),
         body: parsed.data.body, messageId, brainProfileId: profile.id, spec: run, attemptId });
       if (!receipt.duplicate) {
         appendRunEvent(database, runId, attemptId, 1, "run.queued", `${role.replaceAll("_", " ")} question queued`);
@@ -1400,7 +1402,8 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
           run, requestingRole: "engineering_director", question: parsed.data.body, questionOnly: true,
           activityContext: questionActivityContext(state),
           directives: state.directives.filter(directive => directive.agentRole === role),
-          conversation: [...state.messages, receipt.message].filter(message => message.agentRole === role).slice(-20).map(({ author, body }) => ({ author, body })),
+          conversation: parsed.data.source === "voice" ? database.getVoiceQuestionConversation(projectId, parsed.data.requestId)
+            : [...state.messages, receipt.message].filter(message => message.agentRole === role).slice(-20).map(({ author, body }) => ({ author, body })),
           projectContext: state.contexts.find(document => document.repositoryId === null)?.content ?? "",
           repositoryContexts: repositories.map(repository => ({ repositoryId: repository.id, name: repository.name,
             content: state.contexts.find(document => document.repositoryId === repository.id)?.content ?? "" })),
@@ -1411,7 +1414,7 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
       }
       return context.json(receipt, receipt.duplicate ? 200 : 202);
     } catch (error) {
-      return context.json({ error: "question_rejected", message: error instanceof Error ? error.message : "Unable to start a question" }, 409);
+      return context.json({ error: error instanceof QuestionFollowUpError ? "follow_up_unavailable" : "question_rejected", message: error instanceof Error ? error.message : "Unable to start a question" }, 409);
     }
   });
 
@@ -1583,8 +1586,6 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
         limits: {
           timeoutSeconds: settings.defaultRunTimeoutSeconds,
           retries: settings.defaultRunRetries,
-          ...(settings.defaultTokenBudget === null ? {} : { tokenBudget: settings.defaultTokenBudget }),
-          ...(settings.defaultCostBudgetCents === null ? {} : { costBudgetCents: settings.defaultCostBudgetCents }),
         },
       };
       const run = database.createAgentRun(profile.id, runSpec);
@@ -1656,8 +1657,6 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
         permissions: { filesystem: "read-only" as const, networkPolicy: settings.planningNetworkPolicy, allowedTools: ["inspect_repository", "respond_to_request"] },
         limits: {
           timeoutSeconds: settings.defaultRunTimeoutSeconds, retries: settings.defaultRunRetries,
-          ...(settings.defaultTokenBudget === null ? {} : { tokenBudget: settings.defaultTokenBudget }),
-          ...(settings.defaultCostBudgetCents === null ? {} : { costBudgetCents: settings.defaultCostBudgetCents }),
         },
       };
       const run = database.createAgentRun(profile.id, runSpec);
@@ -2127,8 +2126,6 @@ export function createApp(database: TeamDatabase, options: AppOptions): Hono {
       limits: {
         timeoutSeconds: settings.defaultRunTimeoutSeconds,
         retries: settings.defaultRunRetries,
-        ...(settings.defaultTokenBudget === null ? {} : { tokenBudget: settings.defaultTokenBudget }),
-        ...(settings.defaultCostBudgetCents === null ? {} : { costBudgetCents: settings.defaultCostBudgetCents }),
       },
     };
     try {
@@ -2929,6 +2926,7 @@ function runtimeProfileRef(profile: ReturnType<typeof resolveTaskExecutionProfil
 }
 
 function fallbackEligibleReason(error: unknown): string | null {
+  if (error instanceof WorkerAdmissionError) return null;
   const message = error instanceof Error ? error.message : String(error);
   return /(?:quota|usage limit|rate[ _-]?limit|too many requests|\b429\b|unauthori[sz]ed|forbidden|authentication|access token|\b401\b|\b403\b|model.{0,30}(?:unavailable|not found)|provider.{0,30}unavailable|service unavailable|overloaded|capacity|temporarily unavailable|connection (?:failed|refused|reset)|network error|timed? out|timeout|\b5\d\d\b)/i.test(message)
     ? message
@@ -3028,7 +3026,7 @@ async function executeManagedChildRun(
   database: TeamDatabase,
   executor: TaskExecutor,
   request: CodingRunRequest,
-): Promise<CodingRunResponse> {
+): Promise<CodingRunResponse & { admissionDenied?: true }> {
   const { run } = request;
   const attemptId = randomUUID();
   const profile = resolveTaskExecutionProfile(database, run.projectId, run.agentRole);
@@ -3067,7 +3065,8 @@ async function executeManagedChildRun(
     database.completeAgentRun(run.runId, attemptId, result);
     appendNextRunEvent(database, run.runId, attemptId, "run.failed", message);
     database.createAgentMessage({ id: randomUUID(), projectId: run.projectId, agentRole: run.agentRole, author: "system", body: `${run.runPurpose === "verification" ? "Required check" : "Repair run"} failed: ${message}` });
-    return { workerId: `engineering-team-task-${run.runId}`, imageDigest: "unknown", providerThreadId: null, result, branches: [] };
+    return { workerId: `engineering-team-task-${run.runId}`, imageDigest: "unknown", providerThreadId: null, result, branches: [],
+      ...(error instanceof WorkerAdmissionError ? { admissionDenied: true as const } : {}) };
   }
 }
 
@@ -3129,6 +3128,7 @@ async function runTaskVerificationPipeline(
         upstreamArtifacts: [`implementation-run:${baselineRunId}`],
       };
       const response = await executeManagedChildRun(database, executor, { run: runSpec, repositorySources: baselineRequest.repositorySources });
+      if (response.admissionDenied) return { passed: false, summary: response.result.summary };
       if (response.result.status !== "completed") failed.push({ check, summary: response.result.summary });
     }
     if (failed.length === 0) return { passed: true, summary: `${checks.length} required check${checks.length === 1 ? "" : "s"} passed.` };

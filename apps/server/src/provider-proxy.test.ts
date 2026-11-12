@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod, chown, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, request, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { BrainProfileRef } from "@engineering-team/contracts";
 import { bedrockProviderConnection, CodexCredentialStore, resolveProviderConnection, type ProviderConnection } from "./provider-auth.js";
@@ -236,6 +237,64 @@ test("closing a run revokes the provider socket and aborts active upstream strea
   await received; await proxy.close(); await upstreamClosed;
   await assert.rejects(call(proxy.socketPath));
   await assert.rejects(stat(proxy.directory), { code: "ENOENT" });
+});
+
+// Opt in with a locally built worker image; this uses a fake provider, never a paid API.
+// ENGINEERING_TEAM_TEST_DOCKER_IMAGE=local/engineering-team-controller:latest npm test
+test("a network-isolated Docker worker can use its provider relay but cannot connect directly outside the container", {
+  skip: !process.env.ENGINEERING_TEAM_TEST_DOCKER_IMAGE, timeout: 30_000,
+}, async t => {
+  const root = await temporary(t);
+  let calls = 0;
+  const { proxy } = await fixture(t, await apiConnection(root), (req, res, body) => {
+    assert.equal(req.headers.authorization, `Bearer ${secret}`);
+    assert.equal(JSON.parse(body).model, profile.model);
+    calls++;
+    res.end("network-isolated-provider-response");
+  }, root);
+  const workerId = `engineering-team-network-test-${randomUUID()}`;
+  const launcher = fileURLToPath(new URL("./worker-launcher.js", import.meta.url));
+  const script = `
+    import assert from 'node:assert/strict';
+    import { connect } from 'node:net';
+    import { networkInterfaces } from 'node:os';
+    import { startWorkerRelay } from '/worker-launcher.mjs';
+    assert(Object.values(networkInterfaces()).flat().every(address => address.internal), 'Only loopback interfaces should exist');
+    for (const host of ['192.0.2.1', '169.254.169.254', '2001:db8::1']) {
+      await assert.rejects(new Promise((resolve, reject) => {
+        const socket = connect({ host, port: 443 });
+        socket.setTimeout(2000, () => socket.destroy(new Error('Expected immediate network rejection')));
+        socket.once('connect', () => { socket.destroy(); resolve(); });
+        socket.once('error', reject);
+      }), error => ['ENETUNREACH', 'EHOSTUNREACH'].includes(error.code));
+    }
+    const relay = await startWorkerRelay('/provider/proxy.sock');
+    try {
+      const response = await fetch(relay.baseUrl + '/responses', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: ${JSON.stringify(profile.model)}, input: 'test' }),
+      });
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), 'network-isolated-provider-response');
+      const forbidden = await fetch(relay.baseUrl + '/not-allowed');
+      assert.equal(forbidden.status, 403);
+      await forbidden.text();
+      console.log('Provider relay works; direct IPv4, IPv6 and link-local connections are blocked.');
+    } finally { relay.close(); }
+  `;
+  try {
+    const result = await execFileAsync("docker", [
+      "run", "--rm", "--name", workerId, "--network", "none", "--user", "65532:65532", "--read-only",
+      "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "64", "--memory", "256m",
+      "--mount", `type=bind,src=${proxy.directory},dst=/provider,readonly`,
+      "--mount", `type=bind,src=${launcher},dst=/worker-launcher.mjs,readonly`,
+      "--entrypoint", "node", process.env.ENGINEERING_TEAM_TEST_DOCKER_IMAGE!, "--input-type=module", "-e", script,
+    ], { timeout: 25_000, maxBuffer: 1024 * 1024 });
+    assert.match(result.stdout, /Provider relay works/);
+    assert.equal(calls, 1);
+  } finally {
+    await execFileAsync("docker", ["rm", "--force", workerId], { timeout: 5_000 }).catch(() => undefined);
+  }
 });
 
 // Opt in to the real pinned CLI without a Docker daemon or any paid model call.

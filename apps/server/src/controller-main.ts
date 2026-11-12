@@ -1,8 +1,7 @@
-import { execFile, spawn } from "node:child_process";
-import { timingSafeEqual } from "node:crypto";
+import { execFile } from "node:child_process";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, stat } from "node:fs/promises";
-import { createServer } from "node:http";
-import { tmpdir } from "node:os";
+import { createServer, type ServerResponse } from "node:http";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { BedrockClient, ListFoundationModelsCommand, ListInferenceProfilesCommand } from "@aws-sdk/client-bedrock";
@@ -12,11 +11,18 @@ import { agentRoles, runContractSchemaVersion, runPurposes, verificationChecks }
 import { z } from "zod";
 import { captureWorkerCheckout, prepareWorkerCheckout, publishCapturedCheckout, runCaptureGit, type WorkerCheckout } from "./worker-checkout.js";
 import { parseCodingJsonLines, taskAcceptanceCriteriaSchema } from "./coding-result.js";
-import { CodexCredentialStore, resolveProviderConnection } from "./provider-auth.js";
+import { createControllerCredentialStore, resolveProviderConnection } from "./provider-auth.js";
 import { createIntegrationApplier } from "./worker-integration.js";
 import { startProviderProxy } from "./provider-proxy.js";
+import { WorkerAdmissionError, WorkerConcurrency } from "./worker-concurrency.js";
+import { recoverControllerWorkers, removeWorker, runWorkerContainer } from "./worker-runtime.js";
 
 const execFileAsync = promisify(execFile);
+const controllerToken = process.env.ENGINEERING_TEAM_CONTROLLER_TOKEN;
+if (!controllerToken?.trim()) {
+  throw new Error("ENGINEERING_TEAM_CONTROLLER_TOKEN is required. Generate a random secret and configure the same value for the API and worker controller.");
+}
+const workers = new WorkerConcurrency(process.env.ENGINEERING_TEAM_MAX_WORKERS);
 const host = process.env.ENGINEERING_TEAM_CONTROLLER_HOST ?? "0.0.0.0";
 const port = Number(process.env.ENGINEERING_TEAM_CONTROLLER_PORT ?? "4319");
 const workspaceRoot = resolve(process.env.ENGINEERING_TEAM_WORKSPACE_ROOT ?? "/workspaces");
@@ -24,8 +30,7 @@ const worktreeRoot = resolve(process.env.ENGINEERING_TEAM_WORKTREE_ROOT ?? "/wor
 const applyCodingRun = createIntegrationApplier(workspaceRoot, join(worktreeRoot, ".integrations"));
 const workerImage = process.env.ENGINEERING_TEAM_WORKER_IMAGE ?? "local/engineering-team-controller:latest";
 const codexAuthFile = process.env.ENGINEERING_TEAM_CODEX_AUTH_FILE ?? "/run/secrets/codex-auth.json";
-const controllerToken = process.env.ENGINEERING_TEAM_CONTROLLER_TOKEN;
-const credentialStore = new CodexCredentialStore(join(tmpdir(), "engineering-team-provider-auth"));
+const credentialStore = createControllerCredentialStore(worktreeRoot);
 const schemaPath = "/opt/engineering-team/plan-schema.json";
 const codingSchemaPath = "/opt/engineering-team/coding-result-schema.json";
 const consultationSchemaPath = "/opt/engineering-team/consultation-schema.json";
@@ -86,8 +91,6 @@ const requestSchema = z.object({
     }),
     limits: z.object({
       timeoutSeconds: z.number().int().min(30).max(86_400),
-      tokenBudget: z.number().int().positive().optional(),
-      costBudgetCents: z.number().positive().optional(),
       retries: z.number().int().min(0).max(5),
     }),
   }),
@@ -168,8 +171,6 @@ const codingRequestSchema = z.object({
     }),
     limits: z.object({
       timeoutSeconds: z.number().int().min(30).max(86_400),
-      tokenBudget: z.number().int().positive().optional(),
-      costBudgetCents: z.number().positive().optional(),
       retries: z.number().int().min(0).max(5),
     }),
   }).strict(),
@@ -219,8 +220,6 @@ const consultationRequestSchema = z.object({
     }),
     limits: z.object({
       timeoutSeconds: z.number().int().min(30).max(86_400),
-      tokenBudget: z.number().int().positive().optional(),
-      costBudgetCents: z.number().positive().optional(),
       retries: z.number().int().min(0).max(5),
     }),
   }),
@@ -294,12 +293,17 @@ const server = createServer(async (request, response) => {
     return sendJson(response, 200, { status: "ok" });
   }
   if (request.method === "GET" && request.url === "/capabilities") {
-    return sendJson(response, 200, await inspectCapabilities());
+    try { return sendJson(response, 200, await inspectCapabilities()); }
+    catch (error) {
+      if (sendAdmissionError(response, error)) return;
+      return sendJson(response, 500, { error: "capabilities_failed", message: "Unable to inspect the worker image" });
+    }
   }
   if (request.method === "POST" && request.url === "/preflight/codex") {
     try {
       return sendJson(response, 200, await preflightCodex());
     } catch (error) {
+      if (sendAdmissionError(response, error)) return;
       const message = error instanceof Error ? error.message : "Codex preflight failed";
       return sendJson(response, 500, { error: "preflight_failed", message });
     }
@@ -334,20 +338,18 @@ const server = createServer(async (request, response) => {
     : null;
   if (stopWorkerMatch) {
     const runId = stopWorkerMatch[1]!;
+    const cancelled = workers.cancel(runId);
     const workerIds = [`engineering-team-task-${runId}`, `engineering-team-consultation-${runId}`, `engineering-team-run-${runId}`];
     const stopped: string[] = [];
     for (const workerId of workerIds) {
       try {
-        await execFileAsync("docker", ["rm", "--force", workerId], { timeout: 10_000 });
-        stopped.push(workerId);
+        if (await removeWorker(workerId, workers)) stopped.push(workerId);
       } catch (error) {
-        const stderr = typeof error === "object" && error !== null && "stderr" in error ? String(error.stderr) : "";
-        if (stderr.includes("No such container")) continue;
         const message = error instanceof Error ? error.message : "Interrupted worker could not be stopped";
         return sendJson(response, 500, { error: "worker_stop_failed", message });
       }
     }
-    return sendJson(response, 200, { stopped: stopped.length > 0, workerIds: stopped });
+    return sendJson(response, 200, { stopped: cancelled || stopped.length > 0, workerIds: stopped });
   }
   if (request.method === "POST" && request.url === "/task-runs") {
     try {
@@ -359,15 +361,10 @@ const server = createServer(async (request, response) => {
           message: parsed.error.issues[0]?.message ?? "Invalid task run request",
         });
       }
-      const runId = parsed.data.run.runId;
-      beginTaskEventStream(runId);
-      try {
-        return sendJson(response, 200, await executeCodingRun(parsed.data as CodingRunRequest));
-      } finally {
-        const stream = taskEventStreams.get(runId);
-        if (stream) stream.completed = true;
-      }
+      return sendJson(response, 200, await withWorkerSlot(parsed.data.run.runId, response,
+        signal => executeCodingRun(parsed.data as CodingRunRequest, signal)));
     } catch (error) {
+      if (sendAdmissionError(response, error)) return;
       const message = error instanceof Error ? error.message : "Task worker execution failed";
       console.error("Task worker failed", message);
       return sendJson(response, 500, { error: "task_worker_failed", message });
@@ -380,15 +377,10 @@ const server = createServer(async (request, response) => {
       if (!parsed.success) {
         return sendJson(response, 400, { error: "invalid_consultation_request", message: parsed.error.issues[0]?.message ?? "Invalid consultation request" });
       }
-      const runId = parsed.data.run.runId;
-      beginTaskEventStream(runId);
-      try {
-        return sendJson(response, 200, await executeConsultationRun(parsed.data as ConsultationRunRequest));
-      } finally {
-        const stream = taskEventStreams.get(runId);
-        if (stream) stream.completed = true;
-      }
+      return sendJson(response, 200, await withWorkerSlot(parsed.data.run.runId, response,
+        signal => executeConsultationRun(parsed.data as ConsultationRunRequest, signal)));
     } catch (error) {
+      if (sendAdmissionError(response, error)) return;
       const message = error instanceof Error ? error.message : "Consultation worker execution failed";
       console.error("Consultation worker failed", message);
       return sendJson(response, 500, { error: "consultation_worker_failed", message });
@@ -423,17 +415,41 @@ const server = createServer(async (request, response) => {
         message: parsed.error.issues[0]?.message ?? "Invalid run request",
       });
     }
-    const result = await executePlanningRun(parsed.data as PlanningRunRequest);
+    const result = await withWorkerSlot(parsed.data.run.runId, response,
+      signal => executePlanningRun(parsed.data as PlanningRunRequest, signal));
     return sendJson(response, 200, result);
   } catch (error) {
+    if (sendAdmissionError(response, error)) return;
     const message = error instanceof Error ? error.message : "Worker execution failed";
     console.error("Planning worker failed", message);
     return sendJson(response, 500, { error: "worker_failed", message });
   }
 });
 
+function sendAdmissionError(response: ServerResponse, error: unknown): boolean {
+  if (!(error instanceof WorkerAdmissionError)) return false;
+  sendJson(response, 409, { error: error.code, message: error.message });
+  return true;
+}
+
+async function withWorkerSlot<T>(runId: string, response: ServerResponse, execute: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const slot = workers.acquire(runId);
+  const disconnected = () => { if (!response.writableEnded) slot.cancel(); };
+  response.once("close", disconnected);
+  beginTaskEventStream(runId);
+  try {
+    if (response.destroyed) slot.cancel();
+    slot.signal.throwIfAborted();
+    return await execute(slot.signal);
+  } finally {
+    response.off("close", disconnected);
+    const stream = taskEventStreams.get(runId);
+    if (stream) stream.completed = true;
+    slot.release();
+  }
+}
+
 function requestAuthorized(request: import("node:http").IncomingMessage): boolean {
-  if (!controllerToken) return true;
   const authorization = request.headers.authorization;
   if (typeof authorization !== "string") return false;
   const expected = Buffer.from(`Bearer ${controllerToken}`, "utf8");
@@ -459,16 +475,18 @@ async function inspectCapabilities(): Promise<{
     // The capability response reports the missing worker image without failing health checks.
   }
   if (imageDigest) {
+    let slot: ReturnType<WorkerConcurrency["acquire"]> | undefined;
     try {
-      version = (await execFileAsync(
-        "docker",
-        ["run", "--rm", "--entrypoint", "codex", workerImage, "--version"],
-        { timeout: 30_000 },
-      )).stdout.trim() || null;
+      const runId = randomUUID(), workerId = `engineering-team-probe-${runId}`;
+      slot = workers.acquire(runId);
+      version = (await runDocker(["run", "--rm", "--name", workerId, "--network", "none", "--read-only",
+        "--user", "65532:65532", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--memory", "256m", "--pids-limit", "64",
+        "--entrypoint", "codex", workerImage, "--version"], {}, 30_000, workerId, slot.signal)).stdout.trim() || null;
       installed = Boolean(version);
-    } catch {
+    } catch (error) {
+      if (error instanceof WorkerAdmissionError) throw error;
       // The allowlisted image exists but does not contain a runnable Codex binary.
-    }
+    } finally { slot?.release(); }
   }
   return {
     workerImage,
@@ -575,11 +593,24 @@ function describeAwsError(error: unknown): string {
   return message;
 }
 
+const workerOwner = await resolveWorktreeVolume();
+await recoverControllerWorkers(workerOwner, workers);
+let cleanupInProgress = false;
+setInterval(() => {
+  if (cleanupInProgress || workers.pendingCleanup.size === 0) return;
+  cleanupInProgress = true;
+  void (async () => {
+    for (const workerId of [...workers.pendingCleanup]) {
+      try { await removeWorker(workerId, workers); } catch { /* Keep admission blocked and retry later. */ }
+    }
+  })().finally(() => { cleanupInProgress = false; });
+}, 5_000).unref();
+
 server.listen(port, host, () => {
   console.info(`Engineering Team worker controller listening at http://${host}:${port}`);
 });
 
-async function executePlanningRun(request: PlanningRunRequest): Promise<PlanningRunResponse> {
+async function executePlanningRun(request: PlanningRunRequest, signal: AbortSignal): Promise<PlanningRunResponse> {
   const runtime = await resolveWorkerRuntime(request.run.brainProfile);
   const runRoot = join(worktreeRoot, request.run.runId);
   let proxy: Awaited<ReturnType<typeof startProviderProxy>> | undefined;
@@ -616,6 +647,7 @@ async function executePlanningRun(request: PlanningRunRequest): Promise<Planning
       : "/workspace";
     const args = [
       "run", "--rm", "--name", workerId,
+      "--network", "none",
       "--user", "65532:65532",
       "--read-only",
       "--cap-drop", "ALL",
@@ -643,7 +675,7 @@ async function executePlanningRun(request: PlanningRunRequest): Promise<Planning
       ...(request.run.brainProfile.reasoningLevel ? ["--config", `model_reasoning_effort=\"${request.run.brainProfile.reasoningLevel}\"`] : []),
       prompt,
     ];
-    const output = await runDocker(args, {}, request.run.limits.timeoutSeconds * 1_000, workerId);
+    const output = await runDocker(args, {}, request.run.limits.timeoutSeconds * 1_000, workerId, signal);
     const parsed = parseCodexJsonLines(output.stdout);
     return {
       workerId,
@@ -657,7 +689,7 @@ async function executePlanningRun(request: PlanningRunRequest): Promise<Planning
   }
 }
 
-async function executeConsultationRun(request: ConsultationRunRequest): Promise<ConsultationRunResponse> {
+async function executeConsultationRun(request: ConsultationRunRequest, signal: AbortSignal): Promise<ConsultationRunResponse> {
   const runtime = await resolveWorkerRuntime(request.run.brainProfile);
   const runRoot = join(worktreeRoot, request.run.runId);
   let proxy: Awaited<ReturnType<typeof startProviderProxy>> | undefined;
@@ -681,6 +713,7 @@ async function executeConsultationRun(request: ConsultationRunRequest): Promise<
     const workerDirectory = request.run.repositories.length === 1 ? request.run.repositories[0]!.checkoutPath : "/workspace";
     const args = [
       "run", "--rm", "--name", workerId, "--user", "65532:65532", "--read-only", "--cap-drop", "ALL",
+      "--network", "none",
       "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "2g", "--tmpfs", "/tmp:size=256m,mode=1777",
       "--mount", `type=bind,src=${join(worktreeMountpoint, request.run.runId)},dst=/workspace,readonly`,
       "--tmpfs", "/codex-home:size=64m,uid=65532,gid=65532,mode=0700",
@@ -693,7 +726,7 @@ async function executeConsultationRun(request: ConsultationRunRequest): Promise<
       ...(request.run.brainProfile.reasoningLevel ? ["--config", `model_reasoning_effort=\"${request.run.brainProfile.reasoningLevel}\"`] : []),
       buildConsultationPrompt(request),
     ];
-    const output = await runDocker(args, {}, request.run.limits.timeoutSeconds * 1_000, workerId, (line) => recordCodexTaskEvent(request.run.runId, line));
+    const output = await runDocker(args, {}, request.run.limits.timeoutSeconds * 1_000, workerId, signal, (line) => recordCodexTaskEvent(request.run.runId, line));
     const parsed = parseConsultationJsonLines(output.stdout);
     return { workerId, imageDigest, providerThreadId: parsed.threadId, response: parsed.response, directiveActions: parsed.directiveActions, contextUpdates: parsed.contextUpdates, ...(parsed.usage ? { usage: parsed.usage } : {}) };
   } finally {
@@ -701,7 +734,7 @@ async function executeConsultationRun(request: ConsultationRunRequest): Promise<
   }
 }
 
-async function executeCodingRun(request: CodingRunRequest): Promise<CodingRunResponse> {
+async function executeCodingRun(request: CodingRunRequest, signal: AbortSignal): Promise<CodingRunResponse> {
   const readOnly = request.run.permissions.filesystem === "read-only";
   const runtime = await resolveWorkerRuntime(request.run.brainProfile);
   const runRoot = join(worktreeRoot, request.run.runId);
@@ -744,6 +777,7 @@ async function executeCodingRun(request: CodingRunRequest): Promise<CodingRunRes
       : "/workspace";
     const args = [
       "run", "--rm", "--name", workerId,
+      "--network", "none",
       "--user", "65532:65532",
       "--read-only",
       "--cap-drop", "ALL",
@@ -771,7 +805,7 @@ async function executeCodingRun(request: CodingRunRequest): Promise<CodingRunRes
       ...(request.run.brainProfile.reasoningLevel ? ["--config", `model_reasoning_effort=\"${request.run.brainProfile.reasoningLevel}\"`] : []),
       buildCodingPrompt(request),
     ];
-    const output = await runDocker(args, {}, request.run.limits.timeoutSeconds * 1_000, workerId, (line) => recordCodexTaskEvent(request.run.runId, line));
+    const output = await runDocker(args, {}, request.run.limits.timeoutSeconds * 1_000, workerId, signal, (line) => recordCodexTaskEvent(request.run.runId, line));
     const parsed = parseCodingJsonLines(output.stdout, request.run);
     console.info(`Task worker ${workerId} report: ${parsed.summary}`);
 
@@ -1145,40 +1179,17 @@ async function runDocker(
   environment: Record<string, string>,
   timeoutMs: number,
   workerId: string,
+  signal: AbortSignal,
   onStdoutLine?: (line: string) => void,
 ): Promise<{ stdout: string; stderr: string }> {
-  return await new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn("docker", args, {
-      env: { ...process.env, ...environment },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    let pendingStdout = "";
-    const append = (current: string, chunk: Buffer) => (current + chunk.toString("utf8")).slice(-10 * 1024 * 1024);
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout = append(stdout, chunk);
-      pendingStdout += chunk.toString("utf8");
-      const lines = pendingStdout.split(/\r?\n/);
-      pendingStdout = lines.pop() ?? "";
-      for (const line of lines) if (line) onStdoutLine?.(line);
-    });
-    child.stderr.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
-    const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
-      void execFileAsync("docker", ["rm", "--force", workerId]).catch(() => undefined);
-    }, timeoutMs);
-    child.once("error", (error) => {
-      clearTimeout(timeout);
-      rejectPromise(error);
-    });
-    child.once("close", (code) => {
-      clearTimeout(timeout);
-      if (pendingStdout) onStdoutLine?.(pendingStdout);
-      if (code === 0) resolvePromise({ stdout, stderr });
-      else rejectPromise(new Error(`Codex worker exited with status ${code}: ${extractCodexFailure(stdout, stderr)}`));
-    });
-  });
+  try { return await runWorkerContainer(args, environment, timeoutMs, workerId, signal, workerOwner, workers, onStdoutLine); }
+  catch (error) {
+    if (error instanceof Error && "stdout" in error && "stderr" in error) {
+      const message = error.message.startsWith("Codex worker exited with status") ? error.message : "Worker container execution failed";
+      throw new Error(`${message}: ${extractCodexFailure(String(error.stdout), String(error.stderr))}`);
+    }
+    throw error;
+  }
 }
 
 function beginTaskEventStream(runId: string): void {

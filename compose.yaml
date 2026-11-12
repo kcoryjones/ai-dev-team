@@ -19,6 +19,7 @@ services:
       ENGINEERING_TEAM_CONTROLLER_URL: http://controller:4319
       ENGINEERING_TEAM_CONTROLLER_TOKEN: ${ENGINEERING_TEAM_CONTROLLER_TOKEN:?Set a shared worker-controller token}
       ENGINEERING_TEAM_SPEECH_URL: http://speech:4320
+      ENGINEERING_TEAM_TTS_URL: http://tts:4321
       ENGINEERING_TEAM_UID: ${ENGINEERING_TEAM_UID:-1000}
       ENGINEERING_TEAM_GID: ${ENGINEERING_TEAM_GID:-1000}
     volumes:
@@ -74,7 +75,40 @@ services:
     security_opt: ["no-new-privileges:true"]
     pids_limit: 128
     mem_limit: 2g
-    cpus: 4
+    cpus: ${ENGINEERING_TEAM_SPEECH_CPUS:-4}
+    networks: [speech]
+
+  tts-models:
+    profiles: ["voice"]
+    build:
+      context: .
+      target: tts
+    image: local/engineering-team-tts:v1
+    user: "0:0"
+    entrypoint: ["/usr/local/bin/download-tts-model"]
+    volumes:
+      - engineering-team-tts-models:/models
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  tts:
+    profiles: ["voice"]
+    image: local/engineering-team-tts:v1
+    restart: unless-stopped
+    depends_on:
+      tts-models:
+        condition: service_completed_successfully
+    volumes:
+      - engineering-team-tts-models:/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: 2g
+    cpus: ${ENGINEERING_TEAM_TTS_CPUS:-2}
     networks: [speech]
 
   controller:
@@ -88,7 +122,9 @@ services:
       ENGINEERING_TEAM_CONTROLLER_PORT: 4319
       ENGINEERING_TEAM_CONTROLLER_TOKEN: ${ENGINEERING_TEAM_CONTROLLER_TOKEN:?Set a shared worker-controller token}
       ENGINEERING_TEAM_WORKSPACE_ROOT: /workspaces
+      ENGINEERING_TEAM_MAX_WORKERS: ${ENGINEERING_TEAM_MAX_WORKERS:-2}
       ENGINEERING_TEAM_WORKTREE_ROOT: /worktrees
+      ENGINEERING_TEAM_PROVIDER_AUTH_ROOT: /provider-auth
       ENGINEERING_TEAM_WORKER_IMAGE: local/engineering-team-controller:latest
       ENGINEERING_TEAM_CODEX_AUTH_FILE: /run/secrets/codex-auth.json
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -98,6 +134,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - engineering-team-worktrees:/worktrees
+      - engineering-team-provider-auth:/provider-auth
       - ${WORKSPACE_ROOT:-..}:/workspaces:rw
       - ${CODEX_AUTH_FILE:-/dev/null}:/run/secrets/codex-auth.json:ro
       - ${AWS_CONFIG_DIR:-./docker/empty-aws}:/root/.aws:ro
@@ -117,7 +154,9 @@ services:
 volumes:
   engineering-team-data:
   engineering-team-worktrees:
+  engineering-team-provider-auth:
   engineering-team-speech-models:
+  engineering-team-tts-models:
 
 networks:
   speech:

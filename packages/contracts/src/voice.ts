@@ -11,7 +11,7 @@ const aliases: Array<[AgentRole, string[]]> = [
   ["project_manager", ["project manager", "project management", "pm", "team", "everyone", "dev team"]],
   ["architect", ["architect", "architecture"]],
   ["tech_lead", ["tech lead", "technical lead"]],
-  ["backend_developer", ["backend developer", "back end developer", "backend", "back end"]],
+  ["backend_developer", ["backend developer", "back end developer", "back in developer", "backend", "back end"]],
   ["frontend_developer", ["frontend developer", "front end developer", "frontend", "front end"]],
   ["devops_database_engineer", ["devops database engineer", "dev ops database engineer", "database engineer", "devops", "dev ops", "db engineer"]],
   ["qa_engineer", ["qa engineer", "q a engineer", "quality assurance", "qa", "q a"]],
@@ -54,6 +54,11 @@ export function routeVoiceQuestion(transcript: string): VoiceQuestionRoute {
 }
 
 export type VoiceRecipient = AgentRole | "team";
+export function addressedVoiceRecipient(transcript: string): VoiceRecipient | null {
+  const text = transcript.trim().replace(/^hey[,\s]+dev\s+team\b[\s,.:!?-]*/i, "");
+  const address = addresses.find(({ name }) => text.toLowerCase() === name || text.toLowerCase().startsWith(`${name} `) || new RegExp(`^${name}[,:.!?-]`, "i").test(text));
+  return address ? ["team", "everyone", "dev team"].includes(address.name) ? "team" : address.role : null;
+}
 export type VoiceCommandAction = "new_work" | "guidance" | "directive_add" | "directive_remove";
 export interface VoiceCommandInput {
   requestId: string;
@@ -95,6 +100,9 @@ export function routeVoiceRequest(transcript: string): VoiceRequestRoute {
   const recipient: VoiceRecipient = address && !["team", "everyone", "dev team"].includes(address.name) ? address.role : "team";
   const question = routeVoiceQuestion(transcript);
   if (question.recipient === null || !body || body.length > 2000) return { intent: null, recipient: question.recipient === null ? null : recipient, body: question.question, reason: question.reason, autoSubmit: false };
+  if (/^(?:yes|yeah|yep|ok|okay|go ahead|do (?:it|that)|proceed|continue|ship it|approved?)[\s.!?]*$/i.test(body)) {
+    return { intent: null, recipient, body, reason: "Choose a specific action and review it on screen. A spoken acknowledgement does not approve or start work.", autoSubmit: false };
+  }
   const removal = body.match(/^(?:please\s+)?(?:forget|remove|delete)\s+(?:(?:the|my)\s+)?(?:(?:standing\s+)?(?:instruction|directive)\s*(?:(?:to|that|about)\s+)?)(.*)$/i);
   if (removal) return { intent: "directive_remove", recipient, body: removal[1]!.trim(), reason: "Select the saved instruction to remove, then review the affected agents.", autoSubmit: false };
   if (/^(?:please\s+)?(?:from now on\b|always\b|never\b|remember\b)/i.test(body)) {

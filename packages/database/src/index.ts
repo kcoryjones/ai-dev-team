@@ -58,9 +58,13 @@ import type {
   SaveCodingHarnessInput,
   SaveRuntimeProfileInput,
 } from "@engineering-team/contracts";
-import { agentRoles, defaultAgentConsultationRoles, defaultAgentRolePrompts, runContractSchemaVersion } from "@engineering-team/contracts";
+import { agentRoles, defaultAgentConsultationRoles, defaultAgentRolePrompts, runContractSchemaVersion, voiceFollowUpTtlMs, maxVoiceFollowUpExchanges, maxVoiceFollowUpMessageCharacters } from "@engineering-team/contracts";
 import { migrate } from "./migrations.js";
 import { assertTaskReviewEvidence } from "./task-evidence.js";
+
+export class QuestionFollowUpError extends Error {
+  constructor() { super("This follow-up context is unavailable or expired. Review the request as a new question."); }
+}
 
 interface ProjectRow {
   id: string;
@@ -318,8 +322,6 @@ interface ProjectSettingsRow {
   setup_completed_at: string | null;
   default_run_timeout_seconds: number;
   default_run_retries: number;
-  default_token_budget: number | null;
-  default_cost_budget_cents: number | null;
   planning_network_policy: PlanningNetworkPolicy;
   require_plan_approval: 0 | 1;
   created_at: string;
@@ -569,14 +571,6 @@ export class TeamDatabase {
       defaultRunTimeoutSeconds:
         input.defaultRunTimeoutSeconds ?? current.defaultRunTimeoutSeconds,
       defaultRunRetries: input.defaultRunRetries ?? current.defaultRunRetries,
-      defaultTokenBudget:
-        input.defaultTokenBudget === undefined
-          ? current.defaultTokenBudget
-          : input.defaultTokenBudget,
-      defaultCostBudgetCents:
-        input.defaultCostBudgetCents === undefined
-          ? current.defaultCostBudgetCents
-          : input.defaultCostBudgetCents,
       planningNetworkPolicy:
         input.planningNetworkPolicy ?? current.planningNetworkPolicy,
       requirePlanApproval: input.requirePlanApproval ?? current.requirePlanApproval,
@@ -588,7 +582,7 @@ export class TeamDatabase {
         .prepare(
           `UPDATE project_settings SET
             setup_status = ?, setup_completed_at = ?, default_run_timeout_seconds = ?,
-            default_run_retries = ?, default_token_budget = ?, default_cost_budget_cents = ?,
+            default_run_retries = ?,
             planning_network_policy = ?, require_plan_approval = ?, updated_at = ?
            WHERE project_id = ?`,
         )
@@ -597,8 +591,6 @@ export class TeamDatabase {
           updated.setupCompletedAt,
           updated.defaultRunTimeoutSeconds,
           updated.defaultRunRetries,
-          updated.defaultTokenBudget,
-          updated.defaultCostBudgetCents,
           updated.planningNetworkPolicy,
           updated.requirePlanApproval ? 1 : 0,
           updated.updatedAt,
@@ -1984,25 +1976,54 @@ export class TeamDatabase {
 
   getAgentQuestionRequest(projectId: string, requestId: string): (AgentQuestionResponse & { source: "voice" | "text" }) | null {
     const row = this.connection.prepare("SELECT * FROM agent_question_requests WHERE project_id = ? AND request_id = ?")
-      .get(projectId, requestId) as { message_id: string; run_id: string; source: "voice" | "text" } | undefined;
+      .get(projectId, requestId) as { message_id: string; run_id: string; source: "voice" | "text"; follow_up_to: string | null } | undefined;
     if (!row) return null;
     const message = this.connection.prepare("SELECT * FROM agent_messages WHERE id = ?").get(row.message_id) as AgentMessageRow;
     const run = this.getAgentRun(row.run_id);
     if (!run) throw new Error("Question run not found");
-    return { message: mapAgentMessageRow(message), run, source: row.source, duplicate: true };
+    const completedAt = run.completedAt ? Date.parse(run.completedAt) : NaN;
+    const followUpExpiresAt = row.source === "voice" && run.status === "completed" && run.result?.summary?.trim() && Number.isFinite(completedAt)
+      ? new Date(completedAt + voiceFollowUpTtlMs).toISOString() : null;
+    return { message: mapAgentMessageRow(message), run, source: row.source, duplicate: true, followUpTo: row.follow_up_to, followUpExpiresAt };
+  }
+
+  /** Follow only the durable chain accepted when the question was created.
+   * Expiry governs admission, not execution/retries of an already accepted turn. */
+  getVoiceQuestionConversation(projectId: string, requestId: string): Array<{ author: "director" | "agent"; body: string }> {
+    const current = this.getAgentQuestionRequest(projectId, requestId);
+    if (!current || current.source !== "voice") throw new QuestionFollowUpError();
+    const exchanges: Array<Array<{ author: "director" | "agent"; body: string }>> = [];
+    const seen = new Set([requestId]);
+    let parentId = current.followUpTo;
+    const clip = (text: string) => text.length <= maxVoiceFollowUpMessageCharacters ? text
+      : text.slice(0, maxVoiceFollowUpMessageCharacters - 32) + "\n[Earlier message truncated.]";
+    while (parentId && exchanges.length < maxVoiceFollowUpExchanges && !seen.has(parentId)) {
+      seen.add(parentId);
+      const parent = this.getAgentQuestionRequest(projectId, parentId);
+      if (!parent || parent.source !== "voice" || parent.message.agentRole !== current.message.agentRole || parent.run.status !== "completed" || !parent.run.result?.summary?.trim()) throw new QuestionFollowUpError();
+      exchanges.unshift([{ author: "director", body: clip(parent.message.body) }, { author: "agent", body: clip(parent.run.result.summary) }]);
+      parentId = parent.followUpTo;
+    }
+    return [...exchanges.flat(), { author: "director", body: current.message.body }];
   }
 
   createAgentQuestion(record: {
     requestId: string; source: "voice" | "text"; body: string; messageId: string;
+    followUpTo?: string;
     brainProfileId: string; spec: RunSpec; attemptId: string;
   }): AgentQuestionResponse {
     return this.connection.transaction(() => {
       const existing = this.getAgentQuestionRequest(record.spec.projectId, record.requestId);
       if (existing) {
-        if (existing.message.agentRole !== record.spec.agentRole || existing.message.body !== record.body || existing.source !== record.source) {
+        if (existing.message.agentRole !== record.spec.agentRole || existing.message.body !== record.body || existing.source !== record.source || (existing.followUpTo ?? null) !== (record.followUpTo ?? null)) {
           throw new Error("This request ID was already used for a different question.");
         }
         return existing;
+      }
+      if (record.followUpTo) {
+        const parent = this.getAgentQuestionRequest(record.spec.projectId, record.followUpTo);
+        if (record.source !== "voice" || record.followUpTo === record.requestId || parent?.source !== "voice" || parent.message.agentRole !== record.spec.agentRole ||
+            !parent.followUpExpiresAt || Date.parse(parent.followUpExpiresAt) <= Date.now()) throw new QuestionFollowUpError();
       }
       const active = this.connection.prepare(`SELECT 1 FROM agent_question_requests q JOIN agent_runs r ON r.id = q.run_id
         WHERE q.project_id = ? AND q.agent_role = ? AND r.status IN ('queued', 'provisioning', 'running', 'waiting') LIMIT 1`)
@@ -2014,9 +2035,9 @@ export class TeamDatabase {
       const message = this.createAgentMessage({ id: record.messageId, projectId: record.spec.projectId, agentRole: record.spec.agentRole, author: "director", body: record.body });
       const run = this.createAgentRun(record.brainProfileId, record.spec);
       this.createRunAttempt({ id: record.attemptId, runId: run.id, attemptNumber: 1 });
-      this.connection.prepare(`INSERT INTO agent_question_requests(project_id, request_id, agent_role, source, message_id, run_id)
-        VALUES (?, ?, ?, ?, ?, ?)`).run(record.spec.projectId, record.requestId, record.spec.agentRole, record.source, message.id, run.id);
-      return { message, run, duplicate: false };
+      this.connection.prepare(`INSERT INTO agent_question_requests(project_id, request_id, agent_role, source, message_id, run_id, follow_up_to)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`).run(record.spec.projectId, record.requestId, record.spec.agentRole, record.source, message.id, run.id, record.followUpTo ?? null);
+      return { message, run, duplicate: false, followUpTo: record.followUpTo ?? null, followUpExpiresAt: null };
     })();
   }
 
@@ -2964,8 +2985,6 @@ function mapProjectSettingsRow(row: ProjectSettingsRow): ProjectSettingsSummary 
     setupCompletedAt: row.setup_completed_at,
     defaultRunTimeoutSeconds: row.default_run_timeout_seconds,
     defaultRunRetries: row.default_run_retries,
-    defaultTokenBudget: row.default_token_budget,
-    defaultCostBudgetCents: row.default_cost_budget_cents,
     planningNetworkPolicy: row.planning_network_policy,
     requirePlanApproval: row.require_plan_approval === 1,
     createdAt: row.created_at,

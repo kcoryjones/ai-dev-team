@@ -1119,14 +1119,10 @@ function SettingsView({ project, settings, contextDocument, revisions, saveConte
 }) {
   const [timeoutMinutes, setTimeoutMinutes] = useState(String(settings.defaultRunTimeoutSeconds / 60));
   const [retries, setRetries] = useState(String(settings.defaultRunRetries));
-  const [tokenBudget, setTokenBudget] = useState(settings.defaultTokenBudget === null ? "" : String(settings.defaultTokenBudget));
-  const [costBudget, setCostBudget] = useState(settings.defaultCostBudgetCents === null ? "" : String(settings.defaultCostBudgetCents));
   const [networkPolicy, setNetworkPolicy] = useState<PlanningNetworkPolicy>(settings.planningNetworkPolicy);
   useEffect(() => {
     setTimeoutMinutes(String(settings.defaultRunTimeoutSeconds / 60));
     setRetries(String(settings.defaultRunRetries));
-    setTokenBudget(settings.defaultTokenBudget === null ? "" : String(settings.defaultTokenBudget));
-    setCostBudget(settings.defaultCostBudgetCents === null ? "" : String(settings.defaultCostBudgetCents));
     setNetworkPolicy(settings.planningNetworkPolicy);
   }, [settings]);
 
@@ -1135,8 +1131,6 @@ function SettingsView({ project, settings, contextDocument, revisions, saveConte
     await updateProjectSettings({
       defaultRunTimeoutSeconds: Math.round(Number(timeoutMinutes) * 60),
       defaultRunRetries: Number(retries),
-      defaultTokenBudget: tokenBudget.trim() ? Number(tokenBudget) : null,
-      defaultCostBudgetCents: costBudget.trim() ? Number(costBudget) : null,
       planningNetworkPolicy: networkPolicy,
     });
   }
@@ -1146,8 +1140,17 @@ function SettingsView({ project, settings, contextDocument, revisions, saveConte
     <div className="settings-grid">
       <ContextEditor title="Project context" description="Shared knowledge about the product, architecture, repository relationships, conventions, deployment, and constraints." document={contextDocument} revisions={revisions} submitting={submitting} save={saveContext} />
       <form className="settings-card settings-card-wide" onSubmit={(event) => void saveExecutionDefaults(event)}>
-        <div className="settings-card-heading"><span>E</span><div><h3>Execution defaults</h3><p>Run timeout is enforced per worker attempt. Token and cost values are recorded for budget planning and reporting; they are not runtime spending limits.</p></div></div>
-        <div className="setup-field-grid"><label>Run timeout (minutes)<input type="number" min="0.5" max="1440" step="0.5" value={timeoutMinutes} onChange={(event) => setTimeoutMinutes(event.target.value)} required/></label><label>Fallback eligibility<input disabled value="Automatic provider fallback only" aria-label="Retry behavior"/><span>Configured provider failures can trigger one fallback attempt; ordinary execution failures do not retry automatically.</span></label><label>Token target <span>Recorded, not enforced</span><input type="number" min="1" max="10000000" value={tokenBudget} onChange={(event) => setTokenBudget(event.target.value)} placeholder="No project default"/></label><label>Cost target in cents <span>Recorded, not enforced</span><input type="number" min="0.01" max="1000000" step="0.01" value={costBudget} onChange={(event) => setCostBudget(event.target.value)} placeholder="No project default"/></label></div>
+        <div className="settings-card-heading"><span>E</span><div><h3>Execution defaults</h3><p>Set the timeout for each worker attempt and the maximum number of automatic repair passes.</p></div></div>
+        <div className="setup-field-grid">
+          <label>Run timeout (minutes)<input type="number" min="0.5" max="1440" step="0.5" value={timeoutMinutes} onChange={(event) => setTimeoutMinutes(event.target.value)} required/></label>
+          <label>Automatic repair attempts
+            <select value={retries} onChange={(event) => setRetries(event.target.value)} aria-describedby="repair-attempts-help">
+              <option value="0">Disabled</option>
+              {[1, 2, 3, 4, 5].map(count => <option key={count} value={count}>{count} {count === 1 ? "attempt" : "attempts"}</option>)}
+            </select>
+            <span id="repair-attempts-help">Maximum repair passes after required verification fails. Zero disables automatic repairs.</span>
+          </label>
+        </div>
         <label>Planning network policy<select value={networkPolicy} onChange={(event) => setNetworkPolicy(event.target.value as PlanningNetworkPolicy)}><option value="model-provider-only">Model provider only — recommended</option><option value="restricted">Restricted allowlist</option><option value="offline">Offline</option></select></label>
         <div className="settings-lock"><span>✓</span><div><strong>Director plan approval required</strong><small>This safeguard remains enforced for every proposed plan.</small></div></div>
         <div className="settings-card-actions end"><button className="primary-button" type="submit" disabled={submitting}>Save defaults</button></div>

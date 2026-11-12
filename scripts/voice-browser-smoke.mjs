@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 const { chromium } = await import(process.env.VOICE_PLAYWRIGHT_MODULE || "playwright");
 const url = process.env.VOICE_TEST_URL || "http://127.0.0.1:4318";
 const audio = process.env.VOICE_TEST_AUDIO;
+const spokenReply = process.env.VOICE_TEST_SPOKEN_REPLY === "1";
 if (!audio) throw new Error("Set VOICE_TEST_AUDIO to a WAV with initial silence, ‘Hey Dev Team. Architect, what is blocking progress?’, and trailing silence.");
 const browser = await chromium.launch({ headless: true, args: [
   "--no-sandbox", "--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream",
@@ -36,6 +37,7 @@ try {
   await page.getByRole("button", { name: "Enable voice", exact: true }).waitFor();
   mutations.length = 0;
   const started = Date.now();
+  if (spokenReply) await page.getByLabel("Speak replies", { exact: true }).check();
   await page.getByRole("button", { name: "Enable voice", exact: true }).click();
   await page.waitForFunction(() => document.querySelector(".voice-controls strong")?.textContent?.startsWith("Listening for") || document.querySelector(".voice-error"), undefined, { timeout: 65_000 });
   assert.equal(await page.locator(".voice-error").count(), 0, await page.locator(".voice-panel").innerText());
@@ -44,11 +46,17 @@ try {
   assert.match(transcript, /architect/i);
   assert.match(transcript, /progress/i);
   await page.locator(".voice-answer").waitFor();
+  if (spokenReply) {
+    await page.getByText("Speaking reply…", { exact: true }).waitFor();
+    assert.match(await page.locator(".voice-controls strong").innerText(), /paused for speech/);
+  }
   await page.getByRole("button", { name: "Turn off microphone" }).click();
   await page.waitForFunction(() => window.__voiceTracks.every(track => track.readyState === "ended"));
-  assert.equal(mutations.length, 2, "A clear utterance must transcribe and ask exactly once.");
+  if (spokenReply) await page.getByRole("button", { name: /Stop speaking/ }).click();
+  assert.equal(mutations.length, spokenReply ? 3 : 2, "A clear utterance must transcribe, ask, and optionally speak exactly once.");
   assert.equal(mutations[0], "/api/voice/transcribe");
   assert.match(mutations[1], /\/agents\/architect\/questions$/);
+  if (spokenReply) assert.equal(mutations[2], "/api/voice/tts/synthesize");
   console.log(JSON.stringify({ transcript, elapsedMs: Date.now() - started, mutations }));
   if (process.env.VOICE_SCREENSHOT) await page.screenshot({ path: process.env.VOICE_SCREENSHOT, fullPage: true });
 

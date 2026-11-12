@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -8,11 +8,54 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import type { CodingRunRequest, ConsultationRunRequest, PlanningRunRequest } from "@engineering-team/contracts";
 import { TeamDatabase } from "@engineering-team/database";
 import { createApp } from "./app.js";
 import { HttpPlanningExecutor } from "./planning.js";
 import { runCaptureGit } from "./worker-checkout.js";
+import { WorkerAdmissionError } from "./worker-concurrency.js";
+
+const execFileAsync = promisify(execFile);
+
+for (const [label, token] of [["missing", undefined], ["empty", ""], ["whitespace-only", " \t "]] as const) {
+  test(`the controller refuses startup with a ${label} secret before opening a listener`, async () => {
+    await assert.rejects(execFileAsync(process.execPath, [fileURLToPath(new URL("./controller-main.js", import.meta.url))], {
+      env: {
+        PATH: process.env.PATH, ENGINEERING_TEAM_CONTROLLER_HOST: "127.0.0.1", ENGINEERING_TEAM_CONTROLLER_PORT: "0",
+        ...(token === undefined ? {} : { ENGINEERING_TEAM_CONTROLLER_TOKEN: token }),
+      }, timeout: 5_000,
+    }), (error: Error & { code?: number; stdout?: string; stderr?: string }) => {
+      assert.equal(error.code, 1);
+      assert.match(error.stderr ?? "", /ENGINEERING_TEAM_CONTROLLER_TOKEN is required/);
+      assert.doesNotMatch(error.stdout ?? "", /listening at/);
+      return true;
+    });
+  });
+}
+
+test("a freshly generated secret is shared by the API and controller through Compose", {
+  skip: !process.env.ENGINEERING_TEAM_TEST_DOCKER_IMAGE, timeout: 20_000,
+}, async t => {
+  const root = await mkdtemp(join(tmpdir(), "builder-controller-setup-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
+  const envFile = join(root, ".env");
+  const template = await readFile(join(repositoryRoot, ".env.example"), "utf8");
+  await writeFile(envFile, template, { mode: 0o600 });
+  const configArgs = ["compose", "--env-file", envFile, "config", "--format", "json"];
+  const options = { cwd: repositoryRoot, env: { PATH: process.env.PATH }, timeout: 5_000 };
+  await assert.rejects(execFileAsync("docker", configArgs, options),
+    (error: Error & { stderr?: string }) => /ENGINEERING_TEAM_CONTROLLER_TOKEN.*missing a value/.test(error.stderr ?? ""));
+  const generated = await execFileAsync("docker", ["run", "--rm", "--network", "none", "--entrypoint", "node",
+    process.env.ENGINEERING_TEAM_TEST_DOCKER_IMAGE!, "-e", "console.log(require('node:crypto').randomBytes(32).toString('hex'))"], { timeout: 10_000 });
+  const token = generated.stdout.trim();
+  assert.match(token, /^[a-f0-9]{64}$/);
+  await writeFile(envFile, template.replace(/^ENGINEERING_TEAM_CONTROLLER_TOKEN=.*$/m, `ENGINEERING_TEAM_CONTROLLER_TOKEN=${token}`));
+  const configuration = JSON.parse((await execFileAsync("docker", configArgs, options)).stdout);
+  assert.equal(configuration.services.app.environment.ENGINEERING_TEAM_CONTROLLER_TOKEN, token);
+  assert.equal(configuration.services.controller.environment.ENGINEERING_TEAM_CONTROLLER_TOKEN, token);
+});
 
 interface RepositoryInvocation { name: string; checkoutHead: string; workerHead: string; before: string; after: string }
 interface WorkerInvocation extends RepositoryInvocation { args: string[]; repositories: RepositoryInvocation[] }
@@ -22,9 +65,10 @@ interface WorkerInvocation extends RepositoryInvocation { args: string[]; reposi
 // and deliberately alter even a read-only clone from the host side to check
 // that the controller cannot publish assessment output as source changes.
 async function controllerFixture(t: TestContext, { releasePasses = true, commitWorkerChanges = false,
-  secondRepository = "none", scenario = "partial", failInitialQa = false,
+  secondRepository = "none", scenario = "partial", failInitialQa = false, maxWorkers = 2, blockWorkers = false, blockCreation = false,
 }: { releasePasses?: boolean; commitWorkerChanges?: boolean; secondRepository?: "none" | "populated" | "unborn";
-  scenario?: "partial" | "split-repair" | "no-changes" | "capture-failure" | "publish-failure"; failInitialQa?: boolean } = {}) {
+  scenario?: "partial" | "split-repair" | "no-changes" | "capture-failure" | "publish-failure"; failInitialQa?: boolean;
+  maxWorkers?: number; blockWorkers?: boolean; blockCreation?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "builder-controller-"));
   const workspaceRoot = join(root, "workspaces");
   const worktreeRoot = join(root, "worktrees");
@@ -32,8 +76,9 @@ async function controllerFixture(t: TestContext, { releasePasses = true, commitW
   const source = join(workspaceRoot, "backend");
   const invocationFile = join(root, "invocations.jsonl");
   const reportOverrideFile = join(root, "report-override.json");
+  const containers = join(root, "containers");
   const fixtureToken = randomUUID();
-  await Promise.all([mkdir(source, { recursive: true }), mkdir(worktreeRoot), mkdir(bin)]);
+  await Promise.all([mkdir(source, { recursive: true }), mkdir(worktreeRoot), mkdir(bin), mkdir(containers)]);
   await writeFile(invocationFile, "");
   await writeFile(reportOverrideFile, "{}");
   await runCaptureGit(["init", "--quiet", "--initial-branch=main", source]);
@@ -58,10 +103,43 @@ async function controllerFixture(t: TestContext, { releasePasses = true, commitW
 const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const args = process.argv.slice(2);
+let args = process.argv.slice(2);
+const containers = process.env.FIXTURE_CONTAINERS;
+(async () => {
+if (args[0] === 'ps') {
+  const label = args[args.indexOf('--filter') + 1].replace('label=', '');
+  for (const file of fs.readdirSync(containers).filter(file => file.endsWith('.json'))) {
+    const stored = JSON.parse(fs.readFileSync(path.join(containers, file), 'utf8'));
+    if (stored.includes(label)) console.log(file.slice(0, -5));
+  }
+  return;
+}
+if (args[0] === 'create') {
+  const name = args[args.indexOf('--name') + 1];
+  fs.writeFileSync(path.join(containers, name + '.json'), JSON.stringify(['run', ...args.slice(1)]), {flag:'wx'});
+  while (process.env.FIXTURE_BLOCK_CREATION === 'true' && !fs.existsSync(path.join(containers, 'create-release'))) await new Promise(resolve => setTimeout(resolve, 20));
+  console.log(name); return;
+}
+if (args[0] === 'rm') {
+  if (fs.existsSync(path.join(containers, 'fail-cleanup'))) throw new Error('Docker cleanup is unavailable');
+  const name = args.at(-1), stored = path.join(containers, name + '.json');
+  if (!fs.existsSync(stored)) { console.error('No such container'); process.exitCode = 1; return; }
+  try { process.kill(Number(fs.readFileSync(path.join(containers, name + '.started'), 'utf8')), 'SIGTERM'); } catch {}
+  for (const suffix of ['.json', '.started', '.release', '.fail']) fs.rmSync(path.join(containers, name + suffix), {force:true});
+  return;
+}
+if (args[0] === 'start') {
+  const name = args.at(-1);
+  args = JSON.parse(fs.readFileSync(path.join(containers, name + '.json'), 'utf8'));
+  fs.writeFileSync(path.join(containers, name + '.started'), String(process.pid));
+  while (process.env.FIXTURE_BLOCK_WORKERS === 'true' && !fs.existsSync(path.join(containers, name + '.release'))) await new Promise(resolve => setTimeout(resolve, 20));
+  if (fs.existsSync(path.join(containers, name + '.fail'))) throw new Error('Fixture worker execution failed');
+  if (args.includes('--version')) { console.log('codex fixture'); return; }
+}
 if (args[0] === 'volume' && args[1] === 'inspect') console.log(process.env.ENGINEERING_TEAM_WORKTREE_ROOT);
 else if (args[0] === 'image' && args[1] === 'inspect') console.log('sha256:fixture');
 else if (args[0] === 'run') {
+  if (args[args.indexOf('--network') + 1] !== 'none') throw new Error('Every worker must disable external networking');
   const mount = args.find(arg => arg.startsWith('type=bind,') && arg.split(',').includes('dst=/workspace'));
   if (!mount) throw new Error('Missing workspace mount');
   const root = mount.split(',').find(part => part.startsWith('src=')).slice(4);
@@ -111,6 +189,7 @@ else if (args[0] === 'run') {
   if (override.stage === 'all' || (override.stage === 'initial-qa' && initialQa) || (override.stage === 'release' && args.at(-1).includes('This is a Release Manager integration assessment.'))) Object.assign(report, override.report);
   console.log(JSON.stringify({type: 'item.completed', item: {type: 'agent_message', text: JSON.stringify(report)}}));
 } else throw new Error('Unexpected Docker invocation: ' + JSON.stringify(args));
+})().catch(error => { console.error(error.message); process.exitCode = 1; });
 `, { mode: 0o755 });
 
   const listener = createServer();
@@ -127,6 +206,7 @@ else if (args[0] === 'run') {
       ENGINEERING_TEAM_WORKSPACE_ROOT: workspaceRoot, ENGINEERING_TEAM_WORKTREE_ROOT: worktreeRoot,
       ENGINEERING_TEAM_WORKTREE_VOLUME: "fixture-volume", ENGINEERING_TEAM_CODEX_AUTH_FILE: join(root, "no-auth.json"),
       ENGINEERING_TEAM_CONTROLLER_TOKEN: fixtureToken,
+      ENGINEERING_TEAM_MAX_WORKERS: String(maxWorkers), FIXTURE_CONTAINERS: containers, FIXTURE_BLOCK_WORKERS: String(blockWorkers), FIXTURE_BLOCK_CREATION: String(blockCreation),
       FIXTURE_API_KEY: "dummy-key", FIXTURE_INVOCATIONS: invocationFile, FIXTURE_RELEASE_PASSES: String(releasePasses),
       FIXTURE_COMMIT_WORKER_CHANGES: String(commitWorkerChanges),
       FIXTURE_SCENARIO: scenario, FIXTURE_FAIL_INITIAL_QA: String(failInitialQa), FIXTURE_TASK_ID: taskId,
@@ -139,6 +219,9 @@ else if (args[0] === 'run') {
   child.stderr.on("data", chunk => { output += chunk.toString(); });
   t.after(async () => {
     if (child.exitCode === null && child.signalCode === null) { const exited = once(child, "exit"); child.kill("SIGKILL"); await exited; }
+    for (const file of (await readdir(containers)).filter(file => file.endsWith('.started'))) {
+      try { process.kill(Number(await readFile(join(containers, file), "utf8")), "SIGTERM"); } catch { /* Already exited. */ }
+    }
     await rm(root, { recursive: true, force: true });
   });
   await new Promise<void>((resolve, reject) => {
@@ -160,7 +243,7 @@ else if (args[0] === 'run') {
   };
   request.repositorySources = repositories.map(({ repositoryId, name, sourcePath }) => ({ repositoryId, name, sourcePath }));
   return {
-    workspaceRoot, worktreeRoot, source, baseCommit, request, url, repositories,
+    workspaceRoot, worktreeRoot, source, baseCommit, request, url, repositories, containers,
     token: fixtureToken, executor: new HttpPlanningExecutor(url, fixtureToken),
     async setReportOverride(report: Record<string, unknown>, stage: "all" | "initial-qa" | "release" = "all") {
       await writeFile(reportOverrideFile, JSON.stringify({ report, stage }));
@@ -303,11 +386,19 @@ test("the worker controller rejects missing or invalid shared-secret authenticat
   const fixture = await controllerFixture(t);
   const options = { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(fixture.request) } as const;
   const missing = await fetch(`${fixture.url}/task-runs`, options);
+  assert.equal(missing.status, 401);
   assert.equal((await missing.json() as { error: string }).error, "unauthorized");
   const invalid = await fetch(`${fixture.url}/task-runs`, { ...options, headers: { ...options.headers, authorization: `Bearer ${randomUUID()}` } });
+  assert.equal(invalid.status, 401);
   assert.equal((await invalid.json() as { error: string }).error, "unauthorized");
   assert.deepEqual(await fixture.invocations(), []);
   assert.deepEqual(await readdir(fixture.worktreeRoot), []);
+  const unauthorizedHealth = await fetch(`${fixture.url}/health`);
+  assert.equal(unauthorizedHealth.status, 401);
+  await unauthorizedHealth.arrayBuffer();
+  const authorizedHealth = await fetch(`${fixture.url}/health`, { headers: { authorization: `Bearer ${fixture.token}` } });
+  assert.equal(authorizedHealth.status, 200);
+  assert.deepEqual(await authorizedHealth.json(), { status: "ok" });
 });
 
 async function startMultiRepositoryWorkflow(t: TestContext, fixture: Awaited<ReturnType<typeof controllerFixture>>) {
@@ -757,4 +848,130 @@ test("voice new-work policy reaches the planner without directive-update instruc
   assert.match(prompt, /directiveActions MUST be empty/);
   assert.doesNotMatch(prompt, /- directive_update:/);
   assert.equal(await readFile(join(fixture.source, "code.txt"), "utf8"), "original\n");
+});
+
+type ControllerFixture = Awaited<ReturnType<typeof controllerFixture>>;
+function workerRequest(f: ControllerFixture, kind: "task" | "consultation" | "planning", runId = randomUUID()) {
+  const { taskId: _taskId, ...run } = structuredClone(f.request.run);
+  run.runId = runId;
+  if (kind === "task") return { path: "/task-runs", body: { ...f.request, run: { ...f.request.run, runId } }, workerId: `engineering-team-task-${runId}` };
+  if (kind === "consultation") return { path: "/consultation-runs", workerId: `engineering-team-consultation-${runId}`, body: {
+    run: { ...run, projectId: randomUUID(), agentRole: "project_manager", runPurpose: "consultation",
+      permissions: { ...run.permissions, allowedTools: ["inspect_repository", "respond_to_request"] } },
+    requestingRole: "engineering_director", question: "What is blocking progress?", directives: [], conversation: [], projectContext: "",
+    repositoryContexts: [], repositorySources: f.request.repositorySources,
+  } };
+  return { path: "/runs", workerId: `engineering-team-run-${runId}`, body: {
+    run: { ...run, agentRole: "project_manager", runPurpose: "planning", brainProfile: { ...run.brainProfile, modelClass: "planning" },
+      permissions: { ...run.permissions, allowedTools: ["inspect_repository", "respond_to_director"] } },
+    directorMessageId: randomUUID(), directives: [], conversation: [], availableConsultants: [], consultationResults: [],
+    projectContext: "", repositoryContexts: [], repositorySources: f.request.repositorySources,
+  } };
+}
+function submitWorker(f: ControllerFixture, request: ReturnType<typeof workerRequest>, signal?: AbortSignal) {
+  return fetch(f.url + request.path, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${f.token}` },
+    body: JSON.stringify(request.body), ...(signal ? { signal } : {}) });
+}
+async function waitForCondition(condition: () => Promise<boolean>) {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) { if (await condition()) return; await new Promise(resolve => setTimeout(resolve, 20)); }
+  assert.fail("Expected worker lifecycle condition was not reached");
+}
+async function waitForContainer(f: ControllerFixture, workerId: string, suffix = ".started") {
+  await waitForCondition(async () => (await readdir(f.containers)).includes(workerId + suffix));
+}
+async function assertBusy(response: Response, code = "worker_limit_reached") {
+  assert.equal(response.status, 409);
+  assert.equal((await response.json() as { error: string }).error, code);
+}
+
+test("all worker endpoints accept historical run specifications with retired token and cost targets", controllerTest, async t => {
+  const f = await controllerFixture(t);
+  for (const kind of ["task", "consultation", "planning"] as const) {
+    const request = workerRequest(f, kind);
+    Object.assign(request.body.run.limits, { tokenBudget: 25_000, costBudgetCents: 250 });
+    const response = await submitWorker(f, request);
+    assert.equal(response.status, 200, await response.text());
+  }
+});
+
+test("one controller limit covers projects, tasks, consultations, planning, and harness probes", controllerTest, async t => {
+  const f = await controllerFixture(t, { maxWorkers: 2, blockWorkers: true });
+  const task = workerRequest(f, "task"), consultation = workerRequest(f, "consultation"), planning = workerRequest(f, "planning");
+  const taskResponse = submitWorker(f, task), consultationResponse = submitWorker(f, consultation);
+  await Promise.all([waitForContainer(f, task.workerId), waitForContainer(f, consultation.workerId)]);
+  assert.equal((await readdir(f.containers)).filter(name => name.endsWith(".started")).length, 2);
+  await assertBusy(await submitWorker(f, planning));
+  await assertBusy(await submitWorker(f, task), "worker_run_active");
+  await assert.rejects(f.executor.executeTask({ ...f.request, run: { ...f.request.run, runId: randomUUID() } }),
+    (error: unknown) => error instanceof WorkerAdmissionError && error.code === "worker_limit_reached");
+  for (const [path, method] of [["/capabilities", "GET"], ["/preflight/codex", "POST"]] as const) {
+    await assertBusy(await fetch(f.url + path, { method, headers: { authorization: `Bearer ${f.token}` } }));
+  }
+  assert(!(await readdir(f.worktreeRoot)).includes(planning.body.run.runId));
+  await f.executor.stopTaskWorker(task.body.run.runId);
+  assert.equal((await taskResponse).status, 500);
+  await writeFile(join(f.containers, planning.workerId + ".release"), "");
+  const planned = await submitWorker(f, planning);
+  assert.equal(planned.status, 200, await planned.text());
+  await writeFile(join(f.containers, consultation.workerId + ".release"), "");
+  assert.equal((await consultationResponse).status, 200);
+  assert.equal((await readdir(f.containers)).filter(name => name.endsWith(".json")).length, 0);
+});
+
+test("creation-time cancellation never starts the worker and holds its slot until cleanup", controllerTest, async t => {
+  const f = await controllerFixture(t, { maxWorkers: 1, blockCreation: true });
+  const request = workerRequest(f, "task"), result = submitWorker(f, request);
+  await waitForContainer(f, request.workerId, ".json");
+  await f.executor.stopTaskWorker(request.body.run.runId);
+  await assertBusy(await submitWorker(f, workerRequest(f, "planning")));
+  await writeFile(join(f.containers, "create-release"), "");
+  assert.equal((await result).status, 500);
+  assert.deepEqual(await f.invocations(), []);
+  const next = await submitWorker(f, workerRequest(f, "planning"));
+  assert.equal(next.status, 200, await next.text());
+});
+
+test("failed setup and failed workers both release their reservation", controllerTest, async t => {
+  const f = await controllerFixture(t, { maxWorkers: 1, blockWorkers: true });
+  const invalid = structuredClone(f.request);
+  invalid.run.brainProfile.credentialRef = "MISSING_FIXTURE_CREDENTIAL";
+  await assert.rejects(f.executor.executeTask(invalid), /not available/);
+  const failed = workerRequest(f, "task");
+  await writeFile(join(f.containers, failed.workerId + ".fail"), "");
+  await writeFile(join(f.containers, failed.workerId + ".release"), "");
+  assert.equal((await submitWorker(f, failed)).status, 500);
+  const next = workerRequest(f, "consultation");
+  await writeFile(join(f.containers, next.workerId + ".release"), "");
+  assert.equal((await submitWorker(f, next)).status, 200);
+});
+
+test("disconnected clients cancel active workers before capacity is reused", controllerTest, async t => {
+  const f = await controllerFixture(t, { maxWorkers: 1, blockWorkers: true });
+  const request = workerRequest(f, "task"), abort = new AbortController();
+  const result = submitWorker(f, request, abort.signal).catch(error => error);
+  await waitForContainer(f, request.workerId);
+  abort.abort(); await result;
+  await waitForCondition(async () => {
+    const response = await fetch(`${f.url}/task-workers/${request.body.run.runId}/events`, { headers: { authorization: `Bearer ${f.token}` } });
+    return (await response.json() as { completed: boolean }).completed;
+  });
+  assert.equal((await readdir(f.containers)).filter(name => name.endsWith(".json")).length, 0);
+  const next = workerRequest(f, "planning");
+  await writeFile(join(f.containers, next.workerId + ".release"), "");
+  assert.equal((await submitWorker(f, next)).status, 200);
+});
+
+test("uncertain cleanup blocks all new work until container removal is confirmed", controllerTest, async t => {
+  const f = await controllerFixture(t, { maxWorkers: 2, blockWorkers: true });
+  const request = workerRequest(f, "task");
+  await writeFile(join(f.containers, "fail-cleanup"), "");
+  await writeFile(join(f.containers, request.workerId + ".release"), "");
+  await assertBusy(await submitWorker(f, request), "worker_cleanup_pending");
+  await assertBusy(await submitWorker(f, workerRequest(f, "planning")), "worker_cleanup_pending");
+  await rm(join(f.containers, "fail-cleanup"));
+  await f.executor.stopTaskWorker(request.body.run.runId);
+  const next = workerRequest(f, "planning");
+  await writeFile(join(f.containers, next.workerId + ".release"), "");
+  assert.equal((await submitWorker(f, next)).status, 200);
 });

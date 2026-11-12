@@ -20,6 +20,7 @@ FROM dependencies AS build
 
 COPY apps ./apps
 COPY packages ./packages
+COPY scripts/preserve-controller-auth.mjs ./scripts/preserve-controller-auth.mjs
 
 RUN npm run build
 
@@ -90,3 +91,20 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=5 \
 
 ENTRYPOINT ["tini", "--"]
 CMD ["node", "apps/server/dist/controller-main.js"]
+
+FROM runtime AS tts
+
+# 1.13.8 bundles the phonemizer expected by the pinned Piper voice. The 2.x
+# runtime requires a separate phonemizer and is not a drop-in upgrade.
+RUN apt-get update && apt-get install --yes --no-install-recommends curl bzip2 \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker/tts/package.json docker/tts/package-lock.json /opt/tts/
+RUN npm ci --prefix /opt/tts --omit=dev --no-audit --no-fund && rm -rf /root/.npm
+COPY --chmod=755 docker/download-tts-model.sh /usr/local/bin/download-tts-model
+ENV ENGINEERING_TEAM_TTS_HOST=0.0.0.0
+USER 65534:65534
+EXPOSE 4321
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=5 \
+  CMD node -e "fetch('http://127.0.0.1:4321/health').then(async r => { if (!r.ok || !(await r.json()).ready) process.exit(1); }).catch(() => process.exit(1))"
+ENTRYPOINT ["tini", "--"]
+CMD ["node", "apps/server/dist/tts-main.js"]

@@ -39,6 +39,7 @@ const app = createApp(database, {
   workspaceName,
   ...(staticRoot ? { staticRoot } : {}),
   ...(process.env.ENGINEERING_TEAM_SPEECH_URL ? { speechUrl: process.env.ENGINEERING_TEAM_SPEECH_URL } : {}),
+  ...(process.env.ENGINEERING_TEAM_TTS_URL ? { ttsUrl: process.env.ENGINEERING_TEAM_TTS_URL } : {}),
   ...(controllerClient ? { planningExecutor: controllerClient, taskExecutor: controllerClient, harnessInspector: controllerClient } : {}),
 });
 const server = serve({ fetch: app.fetch, hostname: host, port }, (info) => {

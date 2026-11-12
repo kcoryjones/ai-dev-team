@@ -1,12 +1,18 @@
 import { useEffect, useRef, useState } from "react";
-import { agentRoles, routeVoiceRequest, voiceRoleLabels, type AgentQuestionResponse, type AgentRole, type OrchestrationState, type VoiceCommandAction, type VoiceCommandInput, type VoiceCommandReceipt, type VoiceRecipient } from "@engineering-team/contracts";
-import { LocalVoiceSession, type VoicePhase } from "./LocalVoiceSession";
-import { questionPending, readQuestion, submitQuestion, waitForQuestionPoll, type QuestionDraft } from "./questions";
+import { agentRoles, voiceRoleLabels, type AgentQuestionResponse, type AgentRole, type OrchestrationState, type VoiceCommandAction, type VoiceCommandInput, type VoiceCommandReceipt, type VoiceRecipient } from "@engineering-team/contracts";
+import { LocalVoiceSession, type MicrophoneInfo, type VoicePhase } from "./LocalVoiceSession";
+import { QuestionRequestError, questionPending, readQuestion, submitQuestion, waitForQuestionPoll, type QuestionDraft } from "./questions";
 import { confirmCommand, previewCommand, readCommand } from "./commands";
+import { useSpokenReplies } from "./useSpokenReplies";
+import { spokenAcknowledgement, spokenAnswer } from "./spokenReply";
+import { useVoiceFollowUps } from "./useVoiceFollowUps";
+import { useVoiceSettings } from "./useVoiceSettings";
+import { VoiceSettingsPanel } from "./VoiceSettingsPanel";
 
 const labels: Record<VoicePhase, string> = {
   off: "Voice off", loading: "Preparing local voice…", armed: "Listening for ‘Hey Dev Team’",
   capturing: "Listening to your request…", transcribing: "Transcribing locally…", review: "Listening paused for this request",
+  speaking: "Listening paused for speech",
 };
 const actionLabels: Record<VoiceCommandAction, string> = {
   new_work: "Request new work", guidance: "Guide a running task", directive_add: "Save standing instruction", directive_remove: "Remove standing instruction",
@@ -16,9 +22,17 @@ export function VoicePanel({ projectId, orchestration, onConversationChange }: {
   projectId: string; orchestration: OrchestrationState | null; onConversationChange: (role: AgentRole, open: boolean) => void;
 }) {
   const session = useRef<LocalVoiceSession | undefined>(undefined);
+  const controls = useVoiceSettings();
+  const speech = useSpokenReplies(session, controls.settings);
+  const [microphone, setMicrophone] = useState<MicrophoneInfo | null>(null);
+  const [level, setLevel] = useState<{ db: number; clipping: boolean } | null>(null);
+  const followUps = useVoiceFollowUps();
+  const confirmedHere = useRef(new Set<string>());
   const request = useRef<AbortController | undefined>(undefined);
   const seen = useRef(new Set<string>());
   const submitted = useRef<QuestionDraft | null>(null);
+  const submittedGeneration = useRef(0);
+  const microphoneActive = useRef(false);
   const submittedCommand = useRef<VoiceCommandInput | null>(null);
   const callbacks = useRef(onConversationChange);
   callbacks.current = onConversationChange;
@@ -34,6 +48,7 @@ export function VoicePanel({ projectId, orchestration, onConversationChange }: {
   const [commandStep, setCommandStep] = useState<"preview" | "confirm" | "read" | null>(null);
   const [sending, setSending] = useState(false);
   const [attempted, setAttempted] = useState(false);
+  const [followUpRejected, setFollowUpRejected] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [transcript, setTranscript] = useState("");
@@ -53,8 +68,10 @@ export function VoicePanel({ projectId, orchestration, onConversationChange }: {
   async function ask(question: QuestionDraft) {
     request.current?.abort();
     const controller = new AbortController(); request.current = controller;
+    if (submitted.current?.requestId !== question.requestId) submittedGeneration.current = followUps.generation();
+    const followUpGeneration = submittedGeneration.current;
     submitted.current = question;
-    setAttempted(true); setSending(true); setError(""); setNotice("");
+    setAttempted(true); setSending(true); setError(""); setNotice(""); setFollowUpRejected(false);
     try {
       let result = await submitQuestion(projectId, question, controller.signal);
       if (controller.signal.aborted) return;
@@ -66,19 +83,30 @@ export function VoicePanel({ projectId, orchestration, onConversationChange }: {
         setReceipt(result);
       }
       callbacks.current(question.recipient, false);
-      if (result.run.status !== "completed") setError(result.run.result?.summary ?? `Question ${result.run.status.replaceAll("_", " ")}. See the conversation for details.`);
+      if (result.run.status !== "completed") {
+        followUps.reset();
+        setError(result.run.result?.summary ?? `Question ${result.run.status.replaceAll("_", " ")}. See the conversation for details.`);
+      } else {
+        if (microphoneActive.current) followUps.complete(question, result, followUpGeneration);
+        if (result.run.result?.summary) speech.offer(spokenAnswer(`question:${question.requestId}`, question.recipient, result.run.result.summary));
+      }
       session.current?.resume();
     } catch (failure) {
-      if (!controller.signal.aborted) setError(failure instanceof Error ? failure.message : "Unable to ask the question. Retry to reconnect.");
+      if (!controller.signal.aborted) {
+        setError(failure instanceof Error ? failure.message : "Unable to ask the question. Retry to reconnect.");
+        if (failure instanceof QuestionRequestError && failure.code === "follow_up_unavailable") { setFollowUpRejected(true); followUps.reset(); }
+      }
     } finally { if (!controller.signal.aborted) setSending(false); }
   }
 
   async function runCommand(step: "preview" | "confirm" | "read", input?: VoiceCommandInput, restoredId?: string) {
+    followUps.reset();
     request.current?.abort();
     const controller = new AbortController(); request.current = controller;
     if (input) submittedCommand.current = input;
     const id = input?.requestId ?? restoredId ?? command?.input.requestId ?? submittedCommand.current?.requestId ?? (requestId || undefined);
     if (!id) return;
+    if (step === "confirm") confirmedHere.current.add(id);
     setRequestId(id); remember(id); setSending(true); setCommandStep(step); setError(""); setNotice("");
     try {
       let result = step === "preview" ? await previewCommand(projectId, submittedCommand.current!, controller.signal)
@@ -96,6 +124,9 @@ export function VoicePanel({ projectId, orchestration, onConversationChange }: {
       if (result.status !== "prepared") {
         callbacks.current(result.preview.conversationRole, false);
         if (result.status !== "applied") setError(result.message);
+        const acknowledgement = spokenAcknowledgement(result);
+        if (acknowledgement) speech.offer(acknowledgement, confirmedHere.current.has(id));
+        confirmedHere.current.delete(id);
         session.current?.resume();
       }
       setCommandStep(null);
@@ -109,22 +140,33 @@ export function VoicePanel({ projectId, orchestration, onConversationChange }: {
     seen.current.add(id);
     if (seen.current.size > 128) seen.current.delete(seen.current.values().next().value!);
     request.current?.abort(); remember(null);
-    const route = routeVoiceRequest(text);
+    confirmedHere.current.clear();
+    speech.clear();
+    const route = followUps.route(text);
     setTranscript(text); setDraft(route.body); setRecipient(route.recipient ?? ""); setIntent(route.intent ?? ""); setRequestId(id); setTaskId("");
-    setReceipt(null); setCommand(null); setCommandStep(null); setAttempted(false); setSending(false);
+    setReceipt(null); setCommand(null); setCommandStep(null); setAttempted(false); setSending(false); setFollowUpRejected(false);
     submitted.current = null; submittedCommand.current = null; setError(""); setNotice(route.reason ?? "");
-    if (route.autoSubmit && route.recipient) void ask({ requestId: id, recipient: route.recipient === "team" ? "project_manager" : route.recipient, body: route.body, source: "voice" });
+    if (route.autoSubmit && route.recipient) void ask({ requestId: id, recipient: route.recipient === "team" ? "project_manager" : route.recipient, body: route.body, source: "voice",
+      ...(route.followUpTo ? { followUpTo: route.followUpTo } : {}) });
   }
   function enable() {
+    followUps.reset();
     session.current?.stop(); setError("");
-    const next = new LocalVoiceSession({ phase: setPhase, transcript: receiveTranscript, notice: setNotice, error: setError });
-    session.current = next; void next.start();
+    const next = new LocalVoiceSession({ phase: value => { microphoneActive.current = value !== "off"; setPhase(value); if (value === "off") followUps.reset(); }, transcript: receiveTranscript, notice: setNotice, error: setError,
+      microphone: info => { setMicrophone(info); if (info) void controls.refresh(); }, level: setLevel,
+    }, controls.settings);
+    session.current = next;
+    if (speech.active.current) next.pauseForSpeech();
+    void next.start();
   }
   function edit() {
     remember(null); setCommand(null); setCommandStep(null); submittedCommand.current = null;
     setRequestId(crypto.randomUUID()); setError("");
   }
   function clear() {
+    followUps.reset(); setFollowUpRejected(false);
+    confirmedHere.current.clear();
+    speech.clear();
     request.current?.abort(); setSending(false); setAttempted(false); submitted.current = null;
     edit(); setTranscript(""); setDraft(""); setReceipt(null); setNotice(""); session.current?.resume();
   }
@@ -132,6 +174,10 @@ export function VoicePanel({ projectId, orchestration, onConversationChange }: {
     if (!recipient || !intent || !draft.trim() || draft.length > 2000) return;
     if (intent === "question") void ask({ requestId, recipient: recipient === "team" ? "project_manager" : recipient, body: draft.trim(), source: "voice" });
     else void runCommand("preview", { requestId, action: intent, recipient, body: draft.trim(), ...(intent === "guidance" && selectedTaskId ? { taskId: selectedTaskId } : {}) });
+  }
+  function reviewAsNewQuestion() {
+    followUps.reset(); setFollowUpRejected(false); setAttempted(false); setReceipt(null); submitted.current = null;
+    setRequestId(crypto.randomUUID()); setError(""); setNotice("Review this as a new question. Earlier voice replies will not be included.");
   }
   const conversationRole = command?.preview.conversationRole ?? (recipient === "team" || !recipient ? "project_manager" : recipient);
   return <section className="voice-panel" aria-label="Local voice control">
@@ -141,6 +187,22 @@ export function VoicePanel({ projectId, orchestration, onConversationChange }: {
       <button type="button" disabled={phase === "off" && sending} onClick={phase === "off" ? enable : () => session.current?.stop()}>{phase === "off" ? "Enable voice" : "Turn off microphone"}</button>
     </div>
     <p>Say “Hey Dev Team”, then address the team or an agent. Clear questions send automatically. Review work requests and standing instructions before applying them.</p>
+    <div className="voice-follow-up" aria-label="Follow-up context">
+      <span>{followUps.context ? followUps.remaining > 0
+        ? `Follow-ups: ${voiceRoleLabels[followUps.context.recipient]} · ${Math.floor(followUps.remaining / 60)}:${String(followUps.remaining % 60).padStart(2, "0")} remaining`
+        : "Follow-up context expired. Name an agent or ask the team."
+        : "New questions go to the Project Manager unless you name an agent."}</span>
+      <button type="button" disabled={!followUps.context && !sending && speech.phase === "idle"} onClick={() => { speech.stop(); followUps.reset(); setNotice("Follow-up context cleared. Accepted questions can still finish."); }}>New conversation</button>
+    </div>
+    <div className="voice-speech-controls" aria-label="Spoken replies">
+      <label><input type="checkbox" checked={speech.enabled} onChange={event => speech.toggle(event.target.checked)} /> Speak replies</label>
+      {speech.reply && <button type="button" disabled={sending || ["loading", "capturing", "transcribing"].includes(phase) || speech.phase !== "idle"} onClick={speech.replay}>Replay reply</button>}
+      {speech.phase !== "idle" && <button type="button" onClick={speech.stop}>Stop speaking <kbd>Esc</kbd></button>}
+      <span role="status">{speech.phase === "preparing" ? "Preparing speech locally…" : speech.phase === "playing" ? "Speaking reply…" : speech.enabled ? "Spoken replies on for this page" : "Spoken replies off"}</span>
+    </div>
+    {speech.error && <p className="voice-error" role="alert">{speech.error} The full reply remains on screen.</p>}
+    {speech.reply?.shortened && <p className="voice-speech-note">Speech uses a short prose excerpt. Full text and code remain below.</p>}
+    <VoiceSettingsPanel controls={controls} microphoneOn={phase !== "off"} microphone={microphone} level={level} />
     {error && <p className="voice-error" role="alert">{error}</p>}
     {notice && <p role="status">{notice}</p>}
     {transcript && <div className="voice-transcript">
@@ -173,7 +235,8 @@ export function VoicePanel({ projectId, orchestration, onConversationChange }: {
       {commandStep && !sending && error && <button type="button" onClick={() => void runCommand(commandStep)}>Retry {commandStep === "preview" ? "review" : "action"}</button>}
       {commandStep === "preview" && !sending && error && <button type="button" onClick={edit}>Edit request</button>}
       {receipt?.run.status === "completed" && <div className="voice-answer"><span>Answer</span><p>{receipt.run.result?.summary}</p></div>}
-      {attempted && !sending && error && (!receipt || questionPending(receipt)) && <button type="button" onClick={() => { if (submitted.current) void ask(submitted.current); }}>Retry question</button>}
+      {attempted && !sending && error && !followUpRejected && (!receipt || questionPending(receipt)) && <button type="button" onClick={() => { if (submitted.current) void ask(submitted.current); }}>Retry question</button>}
+      {followUpRejected && !sending && <button type="button" onClick={reviewAsNewQuestion}>Review as new question</button>}
       {(receipt || (command && command.status !== "prepared")) && <button type="button" onClick={() => callbacks.current(conversationRole, true)}>Open conversation</button>}
       <button type="button" disabled={sending} onClick={clear}>{attempted || command ? "Clear request" : "Discard transcript"}</button>
     </div>}

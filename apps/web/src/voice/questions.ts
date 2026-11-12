@@ -1,14 +1,19 @@
 import type { AgentQuestionInput, AgentQuestionResponse, AgentRole } from "@engineering-team/contracts";
 
-export interface QuestionDraft { requestId: string; recipient: AgentRole; body: string; source: "voice" | "text" }
+export interface QuestionDraft { requestId: string; recipient: AgentRole; body: string; source: "voice" | "text"; followUpTo?: string }
+
+export class QuestionRequestError extends Error {
+  constructor(message: string, readonly code?: string) { super(message); }
+}
 
 export async function submitQuestion(projectId: string, question: QuestionDraft, signal?: AbortSignal): Promise<AgentQuestionResponse> {
-  const payload: AgentQuestionInput = { requestId: question.requestId, body: question.body, source: question.source };
+  const payload: AgentQuestionInput = { requestId: question.requestId, body: question.body, source: question.source,
+    ...(question.followUpTo ? { followUpTo: question.followUpTo } : {}) };
   const response = await fetch(`/api/projects/${projectId}/agents/${question.recipient}/questions`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), ...(signal ? { signal } : {}),
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(typeof data.message === "string" ? data.message : "Unable to ask this question.");
+  if (!response.ok) throw new QuestionRequestError(typeof data.message === "string" ? data.message : "Unable to ask this question.", typeof data.error === "string" ? data.error : undefined);
   return data as AgentQuestionResponse;
 }
 

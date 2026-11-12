@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { Sha256 } from "@smithy/core/checksum";
 import { SignatureV4 } from "@smithy/signature-v4";
@@ -20,12 +21,19 @@ interface StoredAuth {
   tokens?: { access_token: string; refresh_token?: string; account_id?: string; id_token?: string };
 }
 
+export function createControllerCredentialStore(worktreeRoot: string, fetchToken: typeof fetch = fetch, environment: NodeJS.ProcessEnv = process.env) {
+  return new CodexCredentialStore(
+    resolve(environment.ENGINEERING_TEAM_PROVIDER_AUTH_ROOT ?? "/provider-auth"), fetchToken,
+    [join(tmpdir(), "engineering-team-provider-auth"), join(worktreeRoot, ".provider-auth")],
+  );
+}
+
 // A shared entry serializes refreshes across concurrent runs. Rotated credentials
 // live in a controller-only directory; the host's read-only auth file stays intact.
 export class CodexCredentialStore {
   private entries = new Map<string, Promise<{ auth: StoredAuth; refresh: (rejected: string | undefined) => Promise<void> }>>();
 
-  constructor(private cacheDirectory: string, private fetchToken: typeof fetch = fetch) {}
+  constructor(private cacheDirectory: string, private fetchToken: typeof fetch = fetch, private legacyCacheDirectories: string[] = []) {}
 
   async load(authFile: string) {
     const source = await readFile(authFile);
@@ -48,6 +56,20 @@ export class CodexCredentialStore {
       auth = parseAuth(await readFile(cachePath, "utf8"));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      // Import only this source file's fingerprint, and never replace a durable
+      // entry with an older migration copy. Unreadable/corrupt caches fail closed.
+      for (const directory of this.legacyCacheDirectories) {
+        let legacy: StoredAuth;
+        try {
+          legacy = parseAuth(await readFile(join(directory, `${fingerprint}.json`), "utf8"));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw error;
+        }
+        await persistAuth(cachePath, legacy);
+        auth = legacy;
+        break;
+      }
     }
     let refreshing: Promise<void> | undefined;
     const refresh = async (rejected: string | undefined) => {
@@ -71,14 +93,20 @@ export class CodexCredentialStore {
         if (typeof updated.id_token === "string") tokens.id_token = updated.id_token;
         // Update in memory even if persistence fails: never reuse a rotated token.
         auth.tokens = tokens;
-        const temporary = `${cachePath}.${randomUUID()}`;
-        await writeFile(temporary, JSON.stringify(auth), { mode: 0o600, flag: "wx" });
-        await rename(temporary, cachePath);
+        await persistAuth(cachePath, auth);
       })().finally(() => { refreshing = undefined; });
       await refreshing;
     };
     return { auth, refresh };
   }
+}
+
+async function persistAuth(cachePath: string, auth: StoredAuth): Promise<void> {
+  const temporary = `${cachePath}.${randomUUID()}`;
+  try {
+    await writeFile(temporary, JSON.stringify(auth), { mode: 0o600, flag: "wx" });
+    await rename(temporary, cachePath);
+  } finally { await rm(temporary, { force: true }); }
 }
 
 function parseAuth(raw: string): StoredAuth {

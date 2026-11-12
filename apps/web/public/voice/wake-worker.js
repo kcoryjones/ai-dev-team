@@ -49,7 +49,7 @@ self.onmessage = event => {
           detector.reset(stream);
         }
       }
-      self.postMessage({ type: "processed", wake });
+      self.postMessage({ type: "processed", wake, epoch: event.data.epoch });
     }
   } catch {
     self.postMessage({ type: "error", message: "Local wake-word detection failed. Enable voice to retry." });
